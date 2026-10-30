@@ -984,8 +984,9 @@ end
 --   Accessory   hats, hair, face / neck / shoulder / front / back / waist items, 3D (layered) clothing, shoes
 --   Clothing    classic shirt, pants, t-shirt
 --   Face        classic faces
---   Body        heads (classic and dynamic) and torso / arms / legs of body bundles: the whole body of the rig is
---               rebuilt to match an avatar made with those parts (sizes, meshes and joints), see "body" below
+--   Body        dynamic heads: the head of the rig is rebuilt to match an avatar made with that head (size, mesh and
+--               joints), see "body" below. R15 only.
+-- Also: what the rig wears right now (and taking even the original items off), and the colors of the body parts.
 -- The kind of an item comes from its asset type (asked from Roblox the first time), so any asset id works.
 -- Accessory handling is ported from Manager/VisualAccessories.lua.
 -- ==========================================================
@@ -1010,16 +1011,14 @@ do
         [12] = { Kind = "Clothing", Slot = "Pants", Class = "Pants" },
         [18] = { Kind = "Face", Slot = "Face" },
         -- Field = the property of a HumanoidDescription that takes this asset
-        [17] = { Kind = "Body", Field = "Head" },
-        [79] = { Kind = "Body", Field = "Head" },
-        [27] = { Kind = "Body", Field = "Torso" },
-        [28] = { Kind = "Body", Field = "RightArm" },
-        [29] = { Kind = "Body", Field = "LeftArm" },
-        [30] = { Kind = "Body", Field = "LeftLeg" },
-        [31] = { Kind = "Body", Field = "RightLeg" },
+        [79] = { Kind = "Body", Field = "Head", NeedsR15 = "Dynamic heads" },
     }
-    for _, assetType in ipairs({ 8, 41, 42, 43, 44, 45, 46, 47, 64, 65, 66, 67, 68, 69, 70, 71, 72 }) do
+    for _, assetType in ipairs({ 8, 41, 42, 43, 44, 45, 46, 47 }) do
         TYPE_INFO[assetType] = { Kind = "Accessory" }
+    end
+    -- 3D (layered) clothing and shoes wrap around an R15 body
+    for _, assetType in ipairs({ 64, 65, 66, 67, 68, 69, 70, 71, 72 }) do
+        TYPE_INFO[assetType] = { Kind = "Accessory", NeedsR15 = "3D clothing" }
     end
 
     local applied = {}      -- [assetId] = { Info = TYPE_INFO entry, AssetType = number }
@@ -1271,8 +1270,7 @@ do
     -- short body wearing a tall torso ends up in pieces). So a whole avatar is built from the player's own
     -- description with the chosen parts put in (Players:CreateHumanoidModelFromDescription), and then the size, mesh,
     -- attachments and joint offsets of every body part of the rig are made to match that model. Taking the parts off
-    -- puts every value back from the copy that was made before the first change. R6 rigs take the body shape
-    -- (CharacterMesh) and the head mesh instead.
+    -- puts every value back from the copy that was made before the first change.
     local R15_BODY = {
         "Head", "UpperTorso", "LowerTorso",
         "LeftUpperArm", "LeftLowerArm", "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
@@ -1473,69 +1471,17 @@ do
         store.Body = nil
     end
 
-    local function SyncBodyR6(rig, humanoid, model)
-        local store = Store(rig)
-        local head = rig:FindFirstChild("Head")
-        if not store.Body6 then
-            local meshes = {}
-            for _, child in ipairs(rig:GetChildren()) do
-                if child:IsA("CharacterMesh") then table.insert(meshes, child:Clone()) end
-            end
-            local headMesh = head and head:FindFirstChildWhichIsA("SpecialMesh")
-            store.Body6 = { Meshes = meshes, HeadMesh = headMesh and MeshState(headMesh) or nil }
-        end
-
-        for _, child in ipairs(rig:GetChildren()) do
-            if child:IsA("CharacterMesh") then child:Destroy() end
-        end
-        local changed = false
-        for _, child in ipairs(model:GetChildren()) do
-            if child:IsA("CharacterMesh") then
-                local clone = child:Clone()
-                clone:SetAttribute("VisualCatalogMade", true)
-                clone.Parent = rig
-                changed = true
-            end
-        end
-
-        local modelHead = model:FindFirstChild("Head")
-        local source = modelHead and modelHead:FindFirstChildWhichIsA("SpecialMesh")
-        local mesh = head and head:FindFirstChildWhichIsA("SpecialMesh")
-        if source and mesh then
-            mesh.MeshType = source.MeshType
-            mesh.MeshId = source.MeshId
-            mesh.TextureId = source.TextureId
-            mesh.Scale = source.Scale
-            mesh.Offset = source.Offset
-            changed = true
-        end
-        return changed
-    end
-
-    local function RestoreBodyR6(store, rig)
-        local saved = store.Body6
-        if not saved then return end
-        for _, child in ipairs(rig:GetChildren()) do
-            if child:IsA("CharacterMesh") then child:Destroy() end
-        end
-        for _, mesh in ipairs(saved.Meshes) do mesh:Clone().Parent = rig end
-        RestoreMesh(saved.HeadMesh)
-        store.Body6 = nil
-    end
-
     local function RestoreBody(rig)
-        local store = Store(rig)
-        RestoreBody15(store)
-        RestoreBodyR6(store, rig)
+        RestoreBody15(Store(rig))
     end
 
     local function ApplyBodyToRig(rig, humanoid)
-        local r15 = IsR15(humanoid)
-        local model, problem = BuildBodyModel(r15)
+        if not IsR15(humanoid) then return false, "Dynamic heads need an R15 avatar." end
+        local model, problem = BuildBodyModel(true)
         if not model then return false, problem end
-        local ok, changed = pcall(r15 and SyncBody15 or SyncBodyR6, rig, humanoid, model)
+        local ok, changed = pcall(SyncBody15, rig, humanoid, model)
         if not ok then return false, tostring(changed) end
-        return changed, changed and nil or "The parts did not fit this rig."
+        return changed, changed and nil or "The head did not fit this rig."
     end
 
     -- May yield. Makes every rig match the current overrides (or its own body again when there are none).
@@ -1567,6 +1513,7 @@ do
 
     local function ApplyToRig(entry, assetId, rig, humanoid)
         local info = entry.Info
+        if info.NeedsR15 and not IsR15(humanoid) then return false end
         local source = SourceOf(assetId, info)
         if not source then return false end
 
@@ -1581,6 +1528,131 @@ do
         if info.Kind == "Accessory" then RemoveAccessory(rig, assetId) end
         if info.Kind == "Clothing" then RemoveClothing(rig, assetId, info) end
         if info.Kind == "Face" then RemoveFace(rig, assetId) end
+    end
+
+    -- ---------- what the rig wears, taking original items off, body colors ----------
+    local taken = {}      -- items taken off the rig(s): { Instance, Rig, Name, Kind }
+    local bodyColors = {} -- [region] = Color3 chosen for it
+
+    Catalog.Regions = { "Head", "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+    local REGION_PARTS = {
+        Head = { "Head" },
+        Torso = { "UpperTorso", "LowerTorso", "Torso" },
+        LeftArm = { "LeftUpperArm", "LeftLowerArm", "LeftHand", "Left Arm" },
+        RightArm = { "RightUpperArm", "RightLowerArm", "RightHand", "Right Arm" },
+        LeftLeg = { "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "Left Leg" },
+        RightLeg = { "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" },
+    }
+    local BODY_COLOR_PROPERTY = {
+        Head = "HeadColor3", Torso = "TorsoColor3", LeftArm = "LeftArmColor3",
+        RightArm = "RightArmColor3", LeftLeg = "LeftLegColor3", RightLeg = "RightLegColor3",
+    }
+    local WEARABLE = { Accessory = "Accessory", Shirt = "Shirt", Pants = "Pants", ShirtGraphic = "T-Shirt" }
+
+    local function IsOurs(instance)
+        return instance:GetAttribute("IsCustomAccessory") == true or instance:GetAttribute("VisualCatalogId") ~= nil
+    end
+
+    -- What the first rig wears now: accessories, shirt, pants and t-shirt (also the ones that came with the
+    -- avatar). Ours carry their asset id, so they can be taken off like any catalog item.
+    function Catalog.ListWorn()
+        local first = GetAllRigs()[1]
+        local list = {}
+        if not first then return list end
+        for _, child in ipairs(first.Rig:GetChildren()) do
+            local kind = WEARABLE[child.ClassName]
+            if kind then
+                table.insert(list, {
+                    Instance = child, Kind = kind, Name = child.Name,
+                    AssetId = child:GetAttribute("AssetId") or child:GetAttribute("VisualCatalogId"),
+                    Ours = IsOurs(child),
+                })
+            end
+        end
+        return list
+    end
+
+    -- Takes a worn item off. Our own items are removed; original ones are lifted off the rig(s) and kept, so they
+    -- can be put back (RestoreTaken). May yield for our own items.
+    function Catalog.TakeOff(item)
+        if item.Ours and item.AssetId then
+            Catalog.Remove(item.AssetId)
+            return
+        end
+        local name, class = item.Instance.Name, item.Instance.ClassName
+        for _, rigEntry in ipairs(GetAllRigs()) do
+            for _, child in ipairs(rigEntry.Rig:GetChildren()) do
+                if child.ClassName == class and child.Name == name and not IsOurs(child) then
+                    table.insert(taken, { Instance = child, Rig = rigEntry.Rig, Name = name, Kind = item.Kind })
+                    child.Parent = nil
+                    break
+                end
+            end
+        end
+        Changed()
+    end
+
+    -- The original items that were taken off, one line per name.
+    function Catalog.ListTaken()
+        local list, seen = {}, {}
+        for _, entry in ipairs(taken) do
+            local key = entry.Kind .. ":" .. entry.Name
+            if not seen[key] then
+                seen[key] = true
+                table.insert(list, { Name = entry.Name, Kind = entry.Kind })
+            end
+        end
+        return list
+    end
+
+    function Catalog.RestoreTaken(name, kind)
+        for index = #taken, 1, -1 do
+            local entry = taken[index]
+            if (name == nil or (entry.Name == name and entry.Kind == kind)) then
+                if entry.Rig.Parent then entry.Instance.Parent = entry.Rig end
+                table.remove(taken, index)
+            end
+        end
+        Changed()
+    end
+
+    local function ApplyColors(rig)
+        local store = Store(rig)
+        store.Colors = store.Colors or {}
+        store.BodyColorValues = store.BodyColorValues or {}
+        local bodyColorsInstance = rig:FindFirstChildOfClass("BodyColors")
+        for _, region in ipairs(Catalog.Regions) do
+            local color = bodyColors[region]
+            for _, name in ipairs(REGION_PARTS[region]) do
+                local part = rig:FindFirstChild(name)
+                if part and part:IsA("BasePart") then
+                    if store.Colors[part] == nil then store.Colors[part] = part.Color end
+                    pcall(function() part.Color = color or store.Colors[part] end)
+                end
+            end
+            local property = BODY_COLOR_PROPERTY[region]
+            if bodyColorsInstance then
+                if store.BodyColorValues[property] == nil then store.BodyColorValues[property] = bodyColorsInstance[property] end
+                pcall(function() bodyColorsInstance[property] = color or store.BodyColorValues[property] end)
+            end
+        end
+    end
+
+    -- region = "All" or one of Catalog.Regions; color = a Color3, or nil to give the region its own color back.
+    function Catalog.SetBodyColor(region, color)
+        for _, name in ipairs(Catalog.Regions) do
+            if region == "All" or region == name then bodyColors[name] = color end
+        end
+        for _, rigEntry in ipairs(GetAllRigs()) do pcall(ApplyColors, rigEntry.Rig) end
+        Changed()
+    end
+
+    function Catalog.GetBodyColor(region)
+        return bodyColors[region]
+    end
+
+    function Catalog.ResetColors()
+        Catalog.SetBodyColor("All", nil)
     end
 
     -- ---------- API ----------
@@ -1611,6 +1683,15 @@ do
         local info = assetType and TYPE_INFO[assetType]
         if not info then
             return false, assetType and ("This item type (" .. assetType .. ") can not be worn here yet.") or "Could not read this item from the catalog."
+        end
+
+        if info.NeedsR15 then
+            local fitting = {}
+            for _, rigEntry in ipairs(rigs) do
+                if IsR15(rigEntry.Humanoid) then table.insert(fitting, rigEntry) end
+            end
+            if #fitting == 0 then return false, info.NeedsR15 .. " need an R15 avatar." end
+            rigs = fitting
         end
 
         if info.Kind == "Body" then
@@ -1752,6 +1833,7 @@ do
                             end
                         end
                         if next(bodyOverrides) ~= nil then pcall(ApplyBodyToRig, rigEntry.Rig, rigEntry.Humanoid) end
+                        if next(bodyColors) ~= nil then pcall(ApplyColors, rigEntry.Rig) end
                     end
                 end
             end
@@ -1762,6 +1844,8 @@ do
         alive = false
         Catalog.OnChange = nil
         pcall(Catalog.Clear)
+        pcall(Catalog.ResetColors)
+        pcall(Catalog.RestoreTaken)
     end)
 end
 
@@ -1810,8 +1894,8 @@ local BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537
 
 -- Groups and types. Category / Sub are the web catalog's filters; AssetTypes are the asset type numbers the game's
 -- own catalog takes (8 hat, 41 hair, 42 face, 43 neck, 44 shoulder, 45 front, 46 back, 47 waist, 11 shirt,
--- 12 pants, 2 t-shirt, 64-72 layered clothing, 17 head, 18 face); Bundle is a bundle type (1 body, 3 shoes,
--- 4 dynamic head) instead.
+-- 12 pants, 2 t-shirt, 64-72 layered clothing, 18 face); Bundle is a bundle type (3 shoes, 4 dynamic head)
+-- instead. Direct bundles are worn with one click instead of opening into their parts.
 local GROUPS = {
     { Title = "Featured" },
     { Title = "Accessories", Types = {
@@ -1837,14 +1921,14 @@ local GROUPS = {
         { Title = "Sweater 3D", Category = 3, Sub = 62, AssetTypes = { 68 } },
         { Title = "Shorts 3D", Category = 3, Sub = 63, AssetTypes = { 69 } },
         { Title = "Dress 3D", Category = 3, Sub = 65, AssetTypes = { 72 } },
-        { Title = "Shoes", Category = 3, Sub = 64, Bundle = 3 },
+        { Title = "Shoes", Category = 3, Sub = 64, Bundle = 3, Direct = true },
     } },
     { Title = "Body", Types = {
-        { Title = "Full Bodies", Category = 18, Sub = 37, Bundle = 1 },
-        { Title = "Dynamic Heads", Category = 18, Sub = 66, Bundle = 4 },
-        { Title = "Classic Heads", Category = 18, Sub = 15, AssetTypes = { 17 } },
+        { Title = "Dynamic Heads", Category = 18, Sub = 66, Bundle = 4, Direct = true },
         { Title = "Classic Faces", Category = 18, Sub = 10, AssetTypes = { 18 } },
     } },
+    -- not a catalog list: the avatar itself (what it wears, with a preview) and the colors of its body parts
+    { Title = "Avatar", Pages = { "Wearing", "Colors" } },
 }
 local DEFAULT_GROUP = 2 -- Accessories, "All", most popular first
 
@@ -2125,6 +2209,7 @@ local function BuildCatalogUI()
     local sortIndex, sortChosen = DEFAULT_SORT, false
     local statusUntil = 0
     local PaintAll, Render, LoadMore, SelectGroup, SelectType, UpdateRow, Layout, OpenBundle, ResetBrowse
+    local ToggleDirect, LoadBundleParts, RefreshAvatar, ShowPage
 
     -- one entry per item (assets and bundles are numbered separately), shared by Featured and every result
     local function GetEntry(id, name, extra)
@@ -2207,7 +2292,7 @@ local function BuildCatalogUI()
 
     local function Toggle(entry)
         if entry.IsBundle then
-            OpenBundle(entry)
+            if entry.Direct then ToggleDirect(entry) else OpenBundle(entry) end
             return
         end
         if Catalog.IsApplied(entry.Id) then
@@ -2335,6 +2420,7 @@ local function BuildCatalogUI()
     -- The list shown now: the parts of an open bundle, Featured (filtered by the typed text), or catalog results.
     local function CurrentList()
         if view.Bundle then return view.BundleEntries or {} end
+        if GROUPS[view.Group].Pages then return {} end
         if GROUPS[view.Group].Types == nil then
             local query = string.lower(side.Query)
             if query == "" then return featured end
@@ -2411,6 +2497,7 @@ local function BuildCatalogUI()
         for _, item in ipairs(items) do
             local entry = GetEntry(item.Id, item.Name, {
                 IsBundle = item.IsBundle, AssetType = item.AssetType, Price = item.Price, Status = item.Status, Creator = item.Creator,
+                Direct = (item.IsBundle and typeInfo.Direct) or nil,
             })
             if not table.find(view.Entries, entry) then table.insert(view.Entries, entry) end
         end
@@ -2507,7 +2594,7 @@ local function BuildCatalogUI()
     end
 
     -- sideways-scrolling row of chips (mouse wheel, drag or swipe)
-    local function MakeChipRow(y)
+    local function MakeChipRow(y, parent)
         local row = New("ScrollingFrame", {
             BackgroundTransparency = 1,
             BorderSizePixel = 0,
@@ -2518,7 +2605,7 @@ local function BuildCatalogUI()
             ElasticBehavior = Enum.ElasticBehavior.Never,
             AutomaticCanvasSize = Enum.AutomaticSize.X,
             CanvasSize = UDim2.new(),
-        }, inner)
+        }, parent or inner)
         New("UIListLayout", {
             FillDirection = Enum.FillDirection.Horizontal,
             SortOrder = Enum.SortOrder.LayoutOrder,
@@ -2561,8 +2648,9 @@ local function BuildCatalogUI()
         for _, chip in ipairs(typeChips) do chip.Button:Destroy() end
         typeChips = {}
         typeRow.CanvasPosition = Vector2.zero
-        for index, typeInfo in ipairs(GROUPS[view.Group].Types or {}) do
-            typeChips[index] = MakeChip(typeRow, typeInfo.Title, index)
+        local group = GROUPS[view.Group]
+        for index, typeInfo in ipairs(group.Types or group.Pages or {}) do
+            typeChips[index] = MakeChip(typeRow, type(typeInfo) == "table" and typeInfo.Title or typeInfo, index)
             typeChips[index].Button.MouseButton1Click:Connect(function() SelectType(index) end)
         end
     end
@@ -2623,17 +2711,371 @@ local function BuildCatalogUI()
     }, side.Scroll)
     ResponsiveGrid(side.Scroll, GAP, CELL_HEIGHT, 110)
 
+    -- ---------- the Avatar group: what is worn (with a preview) and the colors of the body ----------
+    local avatarPanel = New("Frame", {
+        BackgroundTransparency = 1,
+        Visible = false,
+        Position = UDim2.fromOffset(0, 96),
+        Size = UDim2.new(1, 0, 1, -96),
+    }, inner)
+
+    local function SmallButton(parent, text, width)
+        local button = New("TextButton", {
+            Text = text,
+            Font = FONT_LABEL,
+            TextSize = 12,
+            TextColor3 = THEME.Text,
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            BackgroundColor3 = THEME.Card,
+            BackgroundTransparency = 0.88,
+            Size = UDim2.fromOffset(width, 26),
+        }, parent)
+        Round(button, 8)
+        Stroke(button, 0.85)
+        button.MouseEnter:Connect(function() button.BackgroundTransparency = 0.78 end)
+        button.MouseLeave:Connect(function() button.BackgroundTransparency = 0.88 end)
+        return button
+    end
+
+    -- page 1: preview and the list of what is worn
+    local wearPage = New("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1) }, avatarPanel)
+    local viewHolder = Field(wearPage, UDim2.fromOffset(0, 0), UDim2.new(0.4, -4, 1, 0), "Frame", { ClipsDescendants = true })
+    local viewport = New("ViewportFrame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Ambient = Color3.fromRGB(190, 190, 190),
+        LightColor = Color3.fromRGB(255, 255, 255),
+    }, viewHolder)
+    local viewCamera = New("Camera", { FieldOfView = 30 }, viewport)
+    viewport.CurrentCamera = viewCamera
+    local viewHint = Label(viewHolder, {
+        Text = "Drag to turn",
+        TextSize = 11,
+        TextColor3 = THEME.Muted,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.fromScale(0, 1),
+        Size = UDim2.new(1, 0, 0, 18),
+        ZIndex = 3,
+    })
+
+    local wearList = New("ScrollingFrame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.new(0.4, 4, 0, 0),
+        Size = UDim2.new(0.6, -4, 1, -36),
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = THEME.Muted,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(),
+    }, wearPage)
+    New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, wearList)
+    New("UIPadding", { PaddingRight = UDim.new(0, 6) }, wearList)
+
+    local RestoreAllButton = SmallButton(wearPage, "Put originals back", 140)
+    RestoreAllButton.AnchorPoint = Vector2.new(0, 1)
+    RestoreAllButton.Position = UDim2.new(0.4, 4, 1, 0)
+    RestoreAllButton.MouseButton1Click:Connect(function()
+        Catalog.RestoreTaken()
+        SetStatus("Original items put back.", THEME.Success)
+    end)
+
+    local wearRows = {}
+    local function RefreshWearing()
+        for _, row in ipairs(wearRows) do row:Destroy() end
+        wearRows = {}
+        local order = 0
+
+        local function AddRow(title, subtitle, buttonText, callback)
+            order = order + 1
+            local row = New("Frame", {
+                Size = UDim2.new(1, 0, 0, 40),
+                BackgroundColor3 = THEME.Card,
+                BackgroundTransparency = 0.94,
+                BorderSizePixel = 0,
+                LayoutOrder = order,
+            }, wearList)
+            Round(row, 8)
+            Stroke(row, THEME.StrokeAlpha)
+            Label(row, { Text = title, Font = FONT_LABEL, TextTruncate = Enum.TextTruncate.AtEnd, Position = UDim2.fromOffset(10, 4), Size = UDim2.new(1, -92, 0, 18) })
+            Label(row, { Text = subtitle, TextSize = 11, TextColor3 = THEME.Muted, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -92, 0, 14) })
+            local button = SmallButton(row, buttonText, 70)
+            button.AnchorPoint = Vector2.new(1, 0.5)
+            button.Position = UDim2.new(1, -7, 0.5, 0)
+            button.MouseButton1Click:Connect(callback)
+            table.insert(wearRows, row)
+        end
+
+        local worn = Catalog.ListWorn()
+        if #worn == 0 then
+            order = order + 1
+            local empty = Label(wearList, { Text = "Nothing found on the character.", TextColor3 = THEME.Muted, Size = UDim2.new(1, 0, 0, 24), LayoutOrder = order })
+            table.insert(wearRows, empty)
+        end
+        for _, item in ipairs(worn) do
+            AddRow(item.Name, item.Kind .. (item.Ours and "  ·  added here" or "  ·  original"), "Remove", function()
+                task.spawn(function() Catalog.TakeOff(item) end)
+            end)
+        end
+
+        local takenList = Catalog.ListTaken()
+        if #takenList > 0 then
+            order = order + 1
+            local header = Label(wearList, { Text = "Taken off", Font = FONT_TITLE, TextSize = 13, TextColor3 = THEME.SubText, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = order })
+            table.insert(wearRows, header)
+            for _, item in ipairs(takenList) do
+                AddRow(item.Name, item.Kind .. "  ·  taken off", "Put back", function()
+                    Catalog.RestoreTaken(item.Name, item.Kind)
+                end)
+            end
+        end
+        RestoreAllButton.Visible = #takenList > 0
+    end
+
+    -- the preview: a copy of the rig in a viewport, turned by dragging
+    local yaw, viewCenter, viewFront, viewDistance = 0, Vector3.new(), Vector3.new(0, 0, -1), 10
+    local function PlaceViewCamera()
+        local direction = CFrame.Angles(0, yaw, 0):VectorToWorldSpace(viewFront)
+        viewCamera.CFrame = CFrame.lookAt(viewCenter + direction * viewDistance, viewCenter)
+    end
+
+    local function RefreshViewport()
+        for _, child in ipairs(viewport:GetChildren()) do
+            if child ~= viewCamera then child:Destroy() end
+        end
+        local first = Rigs.GetAll()[1]
+        if not first then
+            viewHint.Text = "No character found yet."
+            return
+        end
+        local ok, clone = pcall(function() return first.Rig:Clone() end)
+        if not ok or not clone then
+            viewHint.Text = "Preview is not available for this character."
+            return
+        end
+        viewHint.Text = "Drag to turn"
+        for _, descendant in ipairs(clone:GetDescendants()) do
+            if descendant:IsA("BaseScript") then
+                descendant:Destroy()
+            elseif descendant:IsA("BasePart") then
+                descendant.Anchored = true
+            end
+        end
+        clone.Parent = viewport
+
+        local ok2, boxCFrame, boxSize = pcall(function() return clone:GetBoundingBox() end)
+        if not ok2 then return end
+        viewCenter = boxCFrame.Position
+        local head = clone:FindFirstChild("Head")
+        local look = head and head.CFrame.LookVector or boxCFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        viewFront = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+        viewDistance = math.max(boxSize.X, boxSize.Y, boxSize.Z) / (2 * math.tan(math.rad(15))) * 1.15
+        PlaceViewCamera()
+    end
+
+    local viewToken = 0
+    local function ScheduleViewport(delay)
+        viewToken = viewToken + 1
+        local mine = viewToken
+        task.delay(delay or 0.35, function()
+            if mine == viewToken and avatarPanel.Visible and wearPage.Visible then RefreshViewport() end
+        end)
+    end
+
+    do
+        local dragging, lastX = false, 0
+        viewHolder.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging, lastX = true, input.Position.X
+            end
+        end)
+        local moved = UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                yaw = yaw - (input.Position.X - lastX) * 0.012
+                lastX = input.Position.X
+                PlaceViewCamera()
+            end
+        end)
+        local ended = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+        end)
+        RegisterCleanup(function()
+            moved:Disconnect()
+            ended:Disconnect()
+        end)
+    end
+
+    -- page 2: body colors
+    local colorPage = New("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false }, avatarPanel)
+    local REGION_TITLES = {
+        { Key = "All", Title = "All" }, { Key = "Head", Title = "Head" }, { Key = "Torso", Title = "Torso" },
+        { Key = "LeftArm", Title = "Left Arm" }, { Key = "RightArm", Title = "Right Arm" },
+        { Key = "LeftLeg", Title = "Left Leg" }, { Key = "RightLeg", Title = "Right Leg" },
+    }
+    local colorRegion = 1
+    local regionRow = MakeChipRow(0, colorPage)
+    local regionChips = {}
+    local colorInfo
+
+    local PALETTE = {
+        { 255, 224, 189 }, { 241, 194, 125 }, { 224, 172, 105 }, { 198, 134, 66 }, { 141, 85, 36 }, { 92, 58, 33 }, { 62, 38, 24 },
+        { 255, 204, 153 }, { 234, 184, 146 }, { 204, 142, 105 }, { 255, 255, 255 }, { 242, 243, 243 }, { 160, 165, 169 }, { 99, 95, 98 },
+        { 27, 42, 53 }, { 0, 0, 0 }, { 196, 40, 28 }, { 218, 133, 65 }, { 245, 205, 48 }, { 75, 151, 75 }, { 40, 127, 71 }, { 18, 238, 212 },
+        { 13, 105, 172 }, { 16, 42, 220 }, { 107, 50, 124 }, { 255, 102, 204 }, { 255, 152, 220 }, { 170, 85, 255 },
+    }
+
+    local function ToHex(color)
+        return string.format("#%02X%02X%02X", math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+    end
+
+    local function RefreshColorInfo()
+        local key = REGION_TITLES[colorRegion].Key
+        local text
+        if key == "All" then
+            local first, mixed = Catalog.GetBodyColor("Head"), false
+            for _, region in ipairs(Catalog.Regions) do
+                if Catalog.GetBodyColor(region) ~= first then mixed = true end
+            end
+            text = mixed and "Different colors per part" or (first and ToHex(first) or "Original colors")
+        else
+            local color = Catalog.GetBodyColor(key)
+            text = color and ToHex(color) or "Original color"
+        end
+        colorInfo.Text = REGION_TITLES[colorRegion].Title .. ":  " .. text
+    end
+
+    local function PaintRegionChips()
+        for index, chip in ipairs(regionChips) do PaintChip(chip, index == colorRegion) end
+    end
+    for index, region in ipairs(REGION_TITLES) do
+        regionChips[index] = MakeChip(regionRow, region.Title, index)
+        regionChips[index].Button.MouseButton1Click:Connect(function()
+            colorRegion = index
+            PaintRegionChips()
+            RefreshColorInfo()
+        end)
+    end
+    PaintRegionChips()
+
+    local swatches = New("ScrollingFrame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(0, 38),
+        Size = UDim2.new(1, 0, 1, -118),
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = THEME.Muted,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(),
+    }, colorPage)
+    New("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 6) }, swatches)
+    New("UIGridLayout", { SortOrder = Enum.SortOrder.LayoutOrder, CellSize = UDim2.fromOffset(40, 40), CellPadding = UDim2.fromOffset(8, 8) }, swatches)
+    for index, rgb in ipairs(PALETTE) do
+        local swatch = New("TextButton", {
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            BackgroundColor3 = Color3.fromRGB(rgb[1], rgb[2], rgb[3]),
+            LayoutOrder = index,
+        }, swatches)
+        Round(swatch, 10)
+        Stroke(swatch, 0.6)
+        swatch.MouseButton1Click:Connect(function()
+            Catalog.SetBodyColor(REGION_TITLES[colorRegion].Key, Color3.fromRGB(rgb[1], rgb[2], rgb[3]))
+            RefreshColorInfo()
+        end)
+    end
+
+    local colorBottom = New("Frame", {
+        BackgroundTransparency = 1,
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.fromScale(0, 1),
+        Size = UDim2.new(1, 0, 0, 74),
+    }, colorPage)
+    local hexBox = Field(colorBottom, UDim2.fromOffset(0, 0), UDim2.new(1, -86, 0, 32), "TextBox", {
+        Text = "",
+        PlaceholderText = "Hex color, like #FFAA00",
+        PlaceholderColor3 = THEME.Muted,
+        TextColor3 = THEME.Text,
+        Font = FONT_BODY,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ClearTextOnFocus = false,
+    })
+    New("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, hexBox)
+    local HexApply = MakeButton(colorBottom, "Apply", true, 78)
+    HexApply.Frame.AnchorPoint = Vector2.new(1, 0)
+    HexApply.Frame.Position = UDim2.new(1, 0, 0, 0)
+
+    colorInfo = Label(colorBottom, { Text = "", TextColor3 = THEME.SubText, Position = UDim2.fromOffset(2, 42), Size = UDim2.new(1, -190, 0, 28) })
+    local ResetColor = SmallButton(colorBottom, "Reset part", 86)
+    ResetColor.AnchorPoint = Vector2.new(1, 0)
+    ResetColor.Position = UDim2.new(1, -94, 0, 42)
+    ResetColor.MouseButton1Click:Connect(function()
+        Catalog.SetBodyColor(REGION_TITLES[colorRegion].Key, nil)
+        RefreshColorInfo()
+    end)
+    local ResetAllColors = SmallButton(colorBottom, "Reset all", 86)
+    ResetAllColors.AnchorPoint = Vector2.new(1, 0)
+    ResetAllColors.Position = UDim2.new(1, 0, 0, 42)
+    ResetAllColors.MouseButton1Click:Connect(function()
+        Catalog.ResetColors()
+        RefreshColorInfo()
+    end)
+
+    local function ApplyHex()
+        local hex = string.match(hexBox.Text, "^%s*#?(%x%x%x%x%x%x)%s*$")
+        if not hex then
+            SetStatus("Type a color like #FFAA00 (six hex digits).", THEME.Danger)
+            return
+        end
+        local color = Color3.fromRGB(tonumber(string.sub(hex, 1, 2), 16), tonumber(string.sub(hex, 3, 4), 16), tonumber(string.sub(hex, 5, 6), 16))
+        Catalog.SetBodyColor(REGION_TITLES[colorRegion].Key, color)
+        RefreshColorInfo()
+    end
+    HexApply.Hit.MouseButton1Click:Connect(ApplyHex)
+    hexBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then ApplyHex() end
+    end)
+    RefreshColorInfo()
+
+    ShowPage = function(index)
+        wearPage.Visible = index == 1
+        colorPage.Visible = index == 2
+        if index == 1 then
+            RefreshWearing()
+            ScheduleViewport(0.05)
+        else
+            RefreshColorInfo()
+        end
+    end
+
+    -- called whenever something is worn, taken off or recolored
+    RefreshAvatar = function()
+        if not avatarPanel.Visible then return end
+        if wearPage.Visible then
+            RefreshWearing()
+            ScheduleViewport(0.4)
+        end
+        RefreshColorInfo()
+    end
+
+
     -- Positions follow what is visible: the type row only exists for groups with types, an open bundle swaps it
     -- for the bundle bar and hides the search box.
     Layout = function()
         local group = GROUPS[view.Group]
         local inBundle = view.Bundle ~= nil
-        local hasTypes = group.Types ~= nil and not inBundle
+        local isPanel = group.Pages ~= nil
+        local hasTypes = (group.Types ~= nil or isPanel) and not inBundle
         typeRow.Visible = hasTypes
         bundleBar.Visible = inBundle
+        avatarPanel.Visible = isPanel
+        side.Scroll.Visible = not isPanel
 
         local searchY = (hasTypes or inBundle) and 96 or 62
-        search.Visible = not inBundle
+        search.Visible = not inBundle and not isPanel
         search.Position = UDim2.fromOffset(0, searchY)
         SortButton.Frame.Position = UDim2.new(1, 0, 0, searchY)
         AddButton.Frame.Position = UDim2.new(1, 0, 0, searchY)
@@ -2646,9 +3088,10 @@ local function BuildCatalogUI()
     UpdateRow = function()
         local isId = LooksLikeId(search.Text)
         local browsing = Browsing()
-        AddButton.Frame.Visible = isId and view.Bundle == nil
+        local isPanel = GROUPS[view.Group].Pages ~= nil
+        AddButton.Frame.Visible = isId and view.Bundle == nil and not isPanel
         SortButton.Frame.Visible = browsing and not isId
-        local right = ((isId or browsing) and view.Bundle == nil) and (SIDE_BUTTON + 8) or 0
+        local right = ((isId or browsing) and view.Bundle == nil and not isPanel) and (SIDE_BUTTON + 8) or 0
         search.Size = UDim2.new(1, -right, 0, 32)
         local keyword = string.match(side.Query, "^%s*(.-)%s*$")
         local shown = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
@@ -2679,16 +3122,36 @@ local function BuildCatalogUI()
             view.Token = view.Token + 1
             side.Scroll.CanvasPosition = Vector2.zero
             Render()
+            if GROUPS[index].Pages then ShowPage(1) end
         end
     end
 
     SelectType = function(index)
         view.TypeIndex = index
         PaintChips()
-        ResetBrowse()
+        if GROUPS[view.Group].Pages then
+            ShowPage(index)
+        else
+            ResetBrowse()
+        end
     end
 
-    -- Opens a bundle: its parts (head, torso, arms, legs, shoes...) become the grid, each worn on its own.
+    -- May yield. The wearable parts of a bundle as entries (cached).
+    LoadBundleParts = function(entry)
+        local cached = bundleParts[entry.Id]
+        if cached then return cached end
+        local parts = {}
+        for _, part in ipairs(FetchBundleParts(entry.Id)) do
+            local assetType = Catalog.AssetTypeOf(part.Id)
+            if assetType and Catalog.IsSupportedType(assetType) then
+                table.insert(parts, GetEntry(part.Id, part.Name, { AssetType = assetType }))
+            end
+        end
+        bundleParts[entry.Id] = parts
+        return parts
+    end
+
+    -- Opens a bundle: its parts (shoes, head, face...) become the grid, each worn on its own.
     OpenBundle = function(entry)
         view.Bundle, view.BundleEntries = entry, nil
         bundleName.Text = entry.Name
@@ -2699,19 +3162,7 @@ local function BuildCatalogUI()
         SetStatus("Loading " .. entry.Name .. "...", THEME.SubText, 30)
 
         task.spawn(function()
-            local cached = bundleParts[entry.Id]
-            local parts = {}
-            if cached then
-                parts = cached
-            else
-                for _, part in ipairs(FetchBundleParts(entry.Id)) do
-                    local assetType = Catalog.AssetTypeOf(part.Id)
-                    if assetType and Catalog.IsSupportedType(assetType) then
-                        table.insert(parts, GetEntry(part.Id, part.Name, { AssetType = assetType }))
-                    end
-                end
-                bundleParts[entry.Id] = parts
-            end
+            local parts = LoadBundleParts(entry)
             if view.Bundle ~= entry then return end
             view.BundleEntries = parts
             Render()
@@ -2720,6 +3171,39 @@ local function BuildCatalogUI()
             else
                 statusUntil = 0
                 ShowHint()
+            end
+        end)
+    end
+
+    -- A bundle that is worn with one click (dynamic heads, shoes): all its parts together, or all of them off.
+    ToggleDirect = function(entry)
+        if BundleWorn(entry) then
+            local ids = {}
+            for _, part in ipairs(bundleParts[entry.Id]) do table.insert(ids, part.Id) end
+            task.spawn(function()
+                Catalog.RemoveMany(ids)
+                PaintAll()
+                SetStatus(entry.Name .. " taken off.", THEME.Success)
+            end)
+            return
+        end
+        SetStatus("Applying " .. entry.Name .. "...", THEME.SubText, 30)
+        task.spawn(function()
+            local parts = LoadBundleParts(entry)
+            if #parts == 0 then
+                SetStatus("Nothing in this bundle can be worn here.", THEME.Danger)
+                return
+            end
+            local list = {}
+            for _, part in ipairs(parts) do
+                if not Catalog.IsApplied(part.Id) then table.insert(list, { Id = part.Id, AssetType = part.AssetType }) end
+            end
+            local ok, message = Catalog.ApplyMany(list)
+            PaintAll()
+            if ok then
+                SetStatus(entry.Name .. " equipped.", THEME.Success)
+            else
+                SetStatus(tostring(message), THEME.Danger, 6)
             end
         end)
     end
@@ -2835,7 +3319,10 @@ local function BuildCatalogUI()
         if Browsing() and NeedsMore() then task.spawn(LoadMore) end
     end)
 
-    Catalog.OnChange = function() PaintAll() end
+    Catalog.OnChange = function()
+        PaintAll()
+        RefreshAvatar()
+    end
 
     RemoveAllButton.Hit.MouseButton1Click:Connect(function()
         local count = Catalog.Clear()
