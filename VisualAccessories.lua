@@ -1175,19 +1175,20 @@ local HOSTS = { "https://catalog.roblox.com", "https://catalog.roproxy.com" }
 local BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 -- Catalog types. Category 11 is Accessories and Sub narrows it to one slot (hair lives under Body, 18) for the web
--- catalog; AssetTypes are the same slots as the game's own catalog (AvatarEditorService) names them.
-local ALL_ACCESSORIES = { "HatAccessory", "HairAccessory", "FaceAccessory", "NeckAccessory", "ShoulderAccessory", "FrontAccessory", "BackAccessory", "WaistAccessory" }
+-- catalog; AssetTypes are the asset type numbers the game's own catalog (AvatarEditorService) takes:
+-- 8 Hat, 41 Hair, 42 Face, 43 Neck, 44 Shoulder, 45 Front, 46 Back, 47 Waist.
+local ALL_ACCESSORIES = { 8, 41, 42, 43, 44, 45, 46, 47 }
 local TYPES = {
     { Key = "Featured", Title = "Featured" },
     { Key = "All", Title = "All", Category = 11, AssetTypes = ALL_ACCESSORIES },
-    { Key = "Head", Title = "Head", Category = 11, Sub = 54, AssetTypes = { "HatAccessory" } },
-    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20, AssetTypes = { "HairAccessory" } },
-    { Key = "Face", Title = "Face", Category = 11, Sub = 21, AssetTypes = { "FaceAccessory" } },
-    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22, AssetTypes = { "NeckAccessory" } },
-    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23, AssetTypes = { "ShoulderAccessory" } },
-    { Key = "Front", Title = "Front", Category = 11, Sub = 24, AssetTypes = { "FrontAccessory" } },
-    { Key = "Back", Title = "Back", Category = 11, Sub = 25, AssetTypes = { "BackAccessory" } },
-    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26, AssetTypes = { "WaistAccessory" } },
+    { Key = "Head", Title = "Head", Category = 11, Sub = 54, AssetTypes = { 8 } },
+    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20, AssetTypes = { 41 } },
+    { Key = "Face", Title = "Face", Category = 11, Sub = 21, AssetTypes = { 42 } },
+    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22, AssetTypes = { 43 } },
+    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23, AssetTypes = { 44 } },
+    { Key = "Front", Title = "Front", Category = 11, Sub = 24, AssetTypes = { 45 } },
+    { Key = "Back", Title = "Back", Category = 11, Sub = 25, AssetTypes = { 46 } },
+    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26, AssetTypes = { 47 } },
 }
 
 local SORTS = {
@@ -1330,11 +1331,25 @@ local engineBroken, engineFailures = false, 0
 local function EngineStart(typeInfo, keyword, sort)
     local params = CatalogSearchParams.new()
     if keyword ~= "" then params.SearchKeyword = keyword end
+    -- enum items are found by their number, so a renamed item cannot break the lookup
     local assetTypes = {}
-    for _, name in ipairs(typeInfo.AssetTypes) do table.insert(assetTypes, Enum.AvatarAssetType[name]) end
+    for _, item in ipairs(Enum.AvatarAssetType:GetEnumItems()) do
+        if table.find(typeInfo.AssetTypes, item.Value) then table.insert(assetTypes, item) end
+    end
+    if #assetTypes == 0 then error("no matching AvatarAssetType") end
     params.AssetTypes = assetTypes
-    params.SortType = Enum.CatalogSortType[sort.Engine]
-    if sort.EngineAggregation then params.SortAggregation = Enum.CatalogSortAggregation[sort.EngineAggregation] end
+    local function EnumNamed(enumType, name)
+        for _, item in ipairs(enumType:GetEnumItems()) do
+            if item.Name == name then return item end
+        end
+        return nil
+    end
+    local sortType = EnumNamed(Enum.CatalogSortType, sort.Engine)
+    if sortType then params.SortType = sortType end
+    if sort.EngineAggregation then
+        local aggregation = EnumNamed(Enum.CatalogSortAggregation, sort.EngineAggregation)
+        if aggregation then params.SortAggregation = aggregation end
+    end
     return game:GetService("AvatarEditorService"):SearchCatalog(params)
 end
 
