@@ -1174,27 +1174,29 @@ local REQUEST_GAP = 0.9 -- seconds between two catalog requests; Roblox answers 
 local HOSTS = { "https://catalog.roblox.com", "https://catalog.roproxy.com" }
 local BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
--- Catalog types: Category 11 is Accessories, Subcategory narrows it to one slot. Hair lives under Body (18).
+-- Catalog types. Category 11 is Accessories and Sub narrows it to one slot (hair lives under Body, 18) for the web
+-- catalog; AssetTypes are the same slots as the game's own catalog (AvatarEditorService) names them.
+local ALL_ACCESSORIES = { "HatAccessory", "HairAccessory", "FaceAccessory", "NeckAccessory", "ShoulderAccessory", "FrontAccessory", "BackAccessory", "WaistAccessory" }
 local TYPES = {
     { Key = "Featured", Title = "Featured" },
-    { Key = "All", Title = "All", Category = 11 },
-    { Key = "Head", Title = "Head", Category = 11, Sub = 54 },
-    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20 },
-    { Key = "Face", Title = "Face", Category = 11, Sub = 21 },
-    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22 },
-    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23 },
-    { Key = "Front", Title = "Front", Category = 11, Sub = 24 },
-    { Key = "Back", Title = "Back", Category = 11, Sub = 25 },
-    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26 },
+    { Key = "All", Title = "All", Category = 11, AssetTypes = ALL_ACCESSORIES },
+    { Key = "Head", Title = "Head", Category = 11, Sub = 54, AssetTypes = { "HatAccessory" } },
+    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20, AssetTypes = { "HairAccessory" } },
+    { Key = "Face", Title = "Face", Category = 11, Sub = 21, AssetTypes = { "FaceAccessory" } },
+    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22, AssetTypes = { "NeckAccessory" } },
+    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23, AssetTypes = { "ShoulderAccessory" } },
+    { Key = "Front", Title = "Front", Category = 11, Sub = 24, AssetTypes = { "FrontAccessory" } },
+    { Key = "Back", Title = "Back", Category = 11, Sub = 25, AssetTypes = { "BackAccessory" } },
+    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26, AssetTypes = { "WaistAccessory" } },
 }
 
 local SORTS = {
-    { Name = "Relevance", Type = 0 },
-    { Name = "Popular", Type = 2, Aggregation = 3 },
-    { Name = "Newest", Type = 3 },
-    { Name = "Most Favorited", Type = 1 },
-    { Name = "Price: Low to High", Type = 4 },
-    { Name = "Price: High to Low", Type = 5 },
+    { Name = "Relevance", Type = 0, Engine = "Relevance" },
+    { Name = "Popular", Type = 2, Aggregation = 3, Engine = "Bestselling", EngineAggregation = "PastWeek" },
+    { Name = "Newest", Type = 3, Engine = "RecentlyCreated" },
+    { Name = "Most Favorited", Type = 1, Engine = "MostFavorited" },
+    { Name = "Price: Low to High", Type = 4, Engine = "PriceLowToHigh" },
+    { Name = "Price: High to Low", Type = 5, Engine = "PriceHighToLow" },
 }
 local DEFAULT_SORT, SEARCH_SORT = 2, 1
 
@@ -1254,6 +1256,12 @@ end
 
 local hostIndex, lastSent = 1, -REQUEST_GAP
 
+-- never faster than one catalog request per REQUEST_GAP, whatever the source
+local function Throttle()
+    while os.clock() - lastSent < REQUEST_GAP do task.wait(0.1) end
+    lastSent = os.clock()
+end
+
 -- May yield. Takes the path and query of a catalog search. Returns the decoded JSON table, or nil, a kind
 -- ("no-request", "rate", "failed") and a detail text.
 local function CatalogGet(path)
@@ -1266,9 +1274,7 @@ local function CatalogGet(path)
     local detail = "unknown error"
     local kind = "failed"
     for attempt = 1, 4 do
-        -- never faster than one request per REQUEST_GAP
-        while os.clock() - lastSent < REQUEST_GAP do task.wait(0.1) end
-        lastSent = os.clock()
+        Throttle()
 
         local host = HOSTS[hostIndex]
         local ok, response = pcall(send, {
@@ -1316,11 +1322,81 @@ local function CatalogUrl(typeInfo, keyword, sort, cursor)
     return "/v1/search/items/details?" .. table.concat(parts, "&")
 end
 
+-- ---------- the game's own catalog (AvatarEditorService, no HTTP involved) ----------
+-- Tried first: it is the catalog the Roblox avatar editor uses and needs no request function. If it is unusable
+-- here (errors three times) the web catalog above takes over for the rest of the session.
+local engineBroken, engineFailures = false, 0
+
+local function EngineStart(typeInfo, keyword, sort)
+    local params = CatalogSearchParams.new()
+    if keyword ~= "" then params.SearchKeyword = keyword end
+    local assetTypes = {}
+    for _, name in ipairs(typeInfo.AssetTypes) do table.insert(assetTypes, Enum.AvatarAssetType[name]) end
+    params.AssetTypes = assetTypes
+    params.SortType = Enum.CatalogSortType[sort.Engine]
+    if sort.EngineAggregation then params.SortAggregation = Enum.CatalogSortAggregation[sort.EngineAggregation] end
+    return game:GetService("AvatarEditorService"):SearchCatalog(params)
+end
+
+local function EngineItems(pages)
+    local list = {}
+    for _, item in ipairs(pages:GetCurrentPage()) do
+        local id, name = item.Id, item.Name
+        local isBundle = string.find(tostring(item.ItemType or ""), "Bundle", 1, true) ~= nil
+        if type(id) == "number" and type(name) == "string" and not isBundle then
+            table.insert(list, { Id = id, Name = name, Price = item.Price, Creator = item.CreatorName })
+        end
+    end
+    return list
+end
+
+-- May yield. Returns items (a list of { Id, Name, Price, Status, Creator }) and whether it was the last page,
+-- or nil, nil, a failure kind ("no-request", "rate", "failed") and a detail text. The view keeps the state of its
+-- source (pages / cursor), so the next call returns the next page.
+local function FetchPage(view, typeInfo, keyword, sort)
+    local engineDetail
+    if not engineBroken and view.Backend ~= "web" then
+        Throttle()
+        local ok, result = pcall(function()
+            if not view.Pages then
+                view.Pages = EngineStart(typeInfo, keyword, sort)
+            elseif not view.Pages.IsFinished then
+                view.Pages:AdvanceToNextPageAsync()
+            end
+            return { Items = EngineItems(view.Pages), Done = view.Pages.IsFinished == true }
+        end)
+        if ok then
+            view.Backend = "engine"
+            return result.Items, result.Done
+        end
+        engineDetail = tostring(result)
+        if view.Backend == "engine" then return nil, nil, "failed", engineDetail end
+        view.Pages = nil
+        engineFailures = engineFailures + 1
+        if engineFailures >= 3 then engineBroken = true end
+    end
+
+    local data, kind, detail = CatalogGet(CatalogUrl(typeInfo, keyword, sort, view.Cursor))
+    if not data then
+        return nil, nil, kind, engineDetail and ("game catalog: " .. engineDetail .. " / web: " .. tostring(detail)) or detail
+    end
+    view.Backend = "web"
+
+    local list = {}
+    for _, item in ipairs(type(data.data) == "table" and data.data or {}) do
+        if type(item.id) == "number" and type(item.name) == "string" then
+            table.insert(list, { Id = item.id, Name = item.name, Price = item.price, Status = item.priceStatus, Creator = item.creatorName })
+        end
+    end
+    view.Cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or nil
+    return list, view.Cursor == nil
+end
+
 local function BuildAccessoriesUI()
     local entryById = {}
     local featured = {}
     local side = { Query = "", TileList = {}, TileByEntry = {} }
-    local view = { Type = 1, Entries = {}, Cursor = nil, Loading = false, Done = false, Failed = false, RetryAt = 0, Token = 0 }
+    local view = { Type = 1, Entries = {}, Cursor = nil, Pages = nil, Backend = nil, Loading = false, Done = false, Failed = false, RetryAt = 0, Token = 0 }
     local sortIndex, sortChosen = DEFAULT_SORT, false
     local statusUntil = 0
     local PaintAll, Render, LoadMore, SelectType, UpdateRow
@@ -1542,16 +1618,16 @@ local function BuildAccessoriesUI()
         if keyword == "" and sort.Type == 0 then sort = SORTS[DEFAULT_SORT] end
 
         SetStatus("Loading accessories...", THEME.SubText, 30)
-        local data, reason, detail = CatalogGet(CatalogUrl(typeInfo, keyword, sort, view.Cursor))
+        local items, done, reason, detail = FetchPage(view, typeInfo, keyword, sort)
         if mine ~= view.Token then return end
         view.Loading = false
 
-        if not data then
+        if not items then
             view.Failed = true
             view.RetryAt = os.clock() + 5
             if detail then warn("[Visual Accessories] catalog: " .. tostring(detail)) end
             if reason == "no-request" then
-                SetStatus("Catalog browsing needs an executor with request support.", THEME.Danger, 6)
+                SetStatus("Catalog browsing is unavailable here: the game catalog failed and this executor has no request function.", THEME.Danger, 8)
                 if view.Type ~= 1 then SelectType(1) end
             elseif reason == "rate" then
                 SetStatus("Roblox is limiting catalog requests. Try again in a moment.", THEME.Danger, 6)
@@ -1561,14 +1637,11 @@ local function BuildAccessoriesUI()
             return
         end
 
-        for _, item in ipairs(type(data.data) == "table" and data.data or {}) do
-            if type(item.id) == "number" and type(item.name) == "string" then
-                local entry = GetEntry(item.id, item.name, { Price = item.price, Status = item.priceStatus, Creator = item.creatorName })
-                if not table.find(view.Entries, entry) then table.insert(view.Entries, entry) end
-            end
+        for _, item in ipairs(items) do
+            local entry = GetEntry(item.Id, item.Name, { Price = item.Price, Status = item.Status, Creator = item.Creator })
+            if not table.find(view.Entries, entry) then table.insert(view.Entries, entry) end
         end
-        view.Cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or nil
-        view.Done = view.Cursor == nil
+        view.Done = done
 
         Render()
         if #view.Entries == 0 then
@@ -1583,7 +1656,7 @@ local function BuildAccessoriesUI()
 
     local function ResetBrowse()
         view.Token = view.Token + 1
-        view.Entries, view.Cursor = {}, nil
+        view.Entries, view.Cursor, view.Pages, view.Backend = {}, nil, nil, nil
         view.Loading, view.Done, view.Failed = false, false, false
         side.Scroll.CanvasPosition = Vector2.zero
         Render()
@@ -1759,8 +1832,8 @@ local function BuildAccessoriesUI()
 
     -- ---------- behaviour ----------
     SelectType = function(index)
-        if index ~= 1 and not RequestFunction() then
-            SetStatus("Catalog browsing needs an executor with request support.", THEME.Danger, 6)
+        if index ~= 1 and engineBroken and not RequestFunction() then
+            SetStatus("Catalog browsing is unavailable here: the game catalog failed and this executor has no request function.", THEME.Danger, 8)
             return
         end
         view.Type = index
@@ -1846,12 +1919,7 @@ local function BuildAccessoriesUI()
 
     PaintChips()
     UpdateRow()
-    if RequestFunction() then
-        SelectType(2) -- "All", most popular first
-    else
-        Render()
-        SetStatus("Catalog browsing needs an executor with request support. Featured and asset IDs still work.", THEME.SubText, 8)
-    end
+    SelectType(2) -- "All", most popular first (falls back to Featured when no catalog source works)
 end
 
 BuildAccessoriesUI()
