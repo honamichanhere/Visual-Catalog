@@ -1223,7 +1223,30 @@ end
 -- ---------- catalog access ----------
 local responseCache = {}
 
--- May yield. Returns the decoded JSON table, or nil and a reason ("no-request", "rate", "failed").
+-- Catalog descriptions can hold control characters or broken UTF-8, which makes JSONDecode throw for the whole page;
+-- those bytes are dropped and the decode is tried again.
+local function SanitizeJson(body)
+    local text = string.gsub(body, "[%z\1-\8\11\12\14-\31\127]", "")
+    if utf8 and utf8.len then
+        for _ = 1, 4000 do
+            local length, badPosition = utf8.len(text)
+            if length then break end
+            text = string.sub(text, 1, badPosition - 1) .. string.sub(text, badPosition + 1)
+        end
+    end
+    return text
+end
+
+local function DecodeJson(body)
+    if type(body) == "table" then return body end
+    if type(body) ~= "string" then return nil, "empty response" end
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok then ok, data = pcall(function() return HttpService:JSONDecode(SanitizeJson(body)) end) end
+    if not ok or type(data) ~= "table" then return nil, "unreadable response" end
+    return data
+end
+
+-- May yield. Returns the decoded JSON table, or nil, a kind ("no-request", "rate", "failed") and a detail text.
 local function CatalogGet(url)
     local hit = responseCache[url]
     if hit and os.clock() - hit.At < CACHE_SECONDS then return hit.Data end
@@ -1231,23 +1254,33 @@ local function CatalogGet(url)
     local send = RequestFunction()
     if not send then return nil, "no-request" end
 
-    for attempt = 1, 2 do
+    local detail = "unknown error"
+    for attempt = 1, 3 do
         local ok, response = pcall(send, { Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
-        if not ok or type(response) ~= "table" then return nil, "failed" end
-
-        local code = response.StatusCode
-        if code == 429 then
-            if attempt == 2 then return nil, "rate" end
-            task.wait(3)
+        if not ok or type(response) ~= "table" then
+            detail = "request error: " .. tostring(response)
+            task.wait(1.5)
         else
-            if code ~= 200 then return nil, "failed" end
-            local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
-            if not decoded or type(data) ~= "table" then return nil, "failed" end
-            responseCache[url] = { At = os.clock(), Data = data }
-            return data
+            local code = response.StatusCode
+            if code == 429 then
+                detail = "HTTP 429"
+                if attempt == 3 then return nil, "rate", detail end
+                task.wait(3)
+            elseif code ~= 200 then
+                detail = "HTTP " .. tostring(code)
+                task.wait(1.5)
+            else
+                local data, problem = DecodeJson(response.Body)
+                if data then
+                    responseCache[url] = { At = os.clock(), Data = data }
+                    return data
+                end
+                detail = problem
+                task.wait(1.5)
+            end
         end
     end
-    return nil, "rate"
+    return nil, "failed", detail
 end
 
 local function CatalogUrl(typeInfo, keyword, sort, cursor)
@@ -1264,7 +1297,7 @@ local function BuildAccessoriesUI()
     local entryById = {}
     local featured = {}
     local side = { Query = "", TileList = {}, TileByEntry = {} }
-    local view = { Type = 1, Entries = {}, Cursor = nil, Loading = false, Done = false, Failed = false, Token = 0 }
+    local view = { Type = 1, Entries = {}, Cursor = nil, Loading = false, Done = false, Failed = false, RetryAt = 0, Token = 0 }
     local sortIndex, sortChosen = DEFAULT_SORT, false
     local statusUntil = 0
     local PaintAll, Render, LoadMore, SelectType, UpdateRow
@@ -1473,7 +1506,11 @@ local function BuildAccessoriesUI()
     end
 
     LoadMore = function()
-        if view.Type == 1 or view.Loading or view.Done or view.Failed then return end
+        if view.Type == 1 or view.Loading or view.Done then return end
+        if view.Failed then
+            if os.clock() < view.RetryAt then return end
+            view.Failed = false
+        end
         view.Loading = true
         local mine = view.Token
         local typeInfo = TYPES[view.Type]
@@ -1482,19 +1519,21 @@ local function BuildAccessoriesUI()
         if keyword == "" and sort.Type == 0 then sort = SORTS[DEFAULT_SORT] end
 
         SetStatus("Loading accessories...", THEME.SubText, 30)
-        local data, reason = CatalogGet(CatalogUrl(typeInfo, keyword, sort, view.Cursor))
+        local data, reason, detail = CatalogGet(CatalogUrl(typeInfo, keyword, sort, view.Cursor))
         if mine ~= view.Token then return end
         view.Loading = false
 
         if not data then
             view.Failed = true
+            view.RetryAt = os.clock() + 5
+            if detail then warn("[Visual Accessories] catalog: " .. tostring(detail)) end
             if reason == "no-request" then
                 SetStatus("Catalog browsing needs an executor with request support.", THEME.Danger, 6)
                 if view.Type ~= 1 then SelectType(1) end
             elseif reason == "rate" then
                 SetStatus("Roblox is limiting catalog requests. Try again in a moment.", THEME.Danger, 6)
             else
-                SetStatus("Could not reach the Roblox catalog.", THEME.Danger, 6)
+                SetStatus("Could not load the catalog (" .. string.sub(tostring(detail), 1, 60) .. "). Scroll again to retry.", THEME.Danger, 6)
             end
             return
         end
