@@ -1,9 +1,10 @@
--- Visual Accessories (standalone) - by Honami
+-- Visual Catalog (standalone) - by Honami
 -- UI is built in this file (styled after Mugiwara UI); the accessory logic is ported from Mugiwara HUB's
--- Manager/VisualAccessories.lua (and the rig lookup of Rigs.lua). Runs in its own window, in any game:
--- Evade uses its custom rigs, every other game the normal Roblox character.
+-- Manager/VisualAccessories.lua (and the rig lookup of Rigs.lua). Browses the Roblox avatar catalog (accessories,
+-- clothing, body parts) and wears items client side. Runs in its own window, in any game: Evade uses its custom
+-- rigs, every other game the normal Roblox character.
 
-local SCRIPT_NAME = "Visual Accessories"
+local SCRIPT_NAME = "Visual Catalog"
 
 -- ==========================================================
 -- Shared shell (identical in Visual Emotes, Visual Carry and Visual Unusual)
@@ -270,7 +271,7 @@ local function CreateShell()
     if not guiParent then guiParent = Players.LocalPlayer:WaitForChild("PlayerGui") end
 
     local Gui = New("ScreenGui", {
-        Name = "VisualAccessories",
+        Name = "VisualCatalog",
         ResetOnSpawn = false,
         IgnoreGuiInset = true,
         DisplayOrder = 10000,
@@ -641,7 +642,7 @@ local function CreateShell()
         for _, tween in ipairs(tweens) do pcall(function() tween:Cancel() end) end
         for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
         pcall(function() Gui:Destroy() end)
-        if getgenv().VisualAccessoriesShell == self then getgenv().VisualAccessoriesShell = nil end
+        if getgenv().VisualCatalogShell == self then getgenv().VisualCatalogShell = nil end
     end
 
     -- Every page puts its swaps / effects back, then the window goes away.
@@ -912,10 +913,10 @@ end
 
 -- The shell shared by every Visual script that is running; the first one to start creates it.
 local function GetShell()
-    local existing = getgenv().VisualAccessoriesShell
+    local existing = getgenv().VisualCatalogShell
     if existing and existing.Alive and existing.Gui and existing.Gui.Parent then return existing end
     local shell = CreateShell()
-    getgenv().VisualAccessoriesShell = shell
+    getgenv().VisualCatalogShell = shell
     return shell
 end
 
@@ -939,11 +940,11 @@ end
 
 -- Run again while an older copy is still open: that copy puts everything back first.
 local env = getgenv()
-if env.VisualAccessoriesCleanup then pcall(env.VisualAccessoriesCleanup) end
-env.VisualAccessoriesCleanup = ModuleCleanup
+if env.VisualCatalogCleanup then pcall(env.VisualCatalogCleanup) end
+env.VisualCatalogCleanup = ModuleCleanup
 
 -- ==========================================================
--- Rigs: which models get the accessories
+-- Rigs: which models get the items
 --   Evade     : the custom rigs in Workspace.Rigs named after the player (menu/inventory and in-game; both are
 --               visual copies, from Games/Evade/Rigs.lua)
 --   any other : the normal Roblox character (R6 or R15)
@@ -979,11 +980,21 @@ do
 end
 
 -- ==========================================================
--- Accessories engine (ported from Manager/VisualAccessories.lua: Marketplace accessories only)
+-- Catalog engine: puts catalog items on the rigs (client side only, nothing is bought or saved)
+--   Accessory   hats, hair, face / neck / shoulder / front / back / waist items, 3D (layered) clothing, shoes
+--   Clothing    classic shirt, pants, t-shirt
+--   Face        classic faces
+--   Head        classic heads; DynamicHead: the head mesh of a dynamic head
+--   Limb        body parts (torso, arms, legs) of body bundles
+-- The kind of an item comes from its asset type (asked from Roblox the first time), so any asset id works.
+-- Accessory handling is ported from Manager/VisualAccessories.lua; body parts reuse the in-place mesh swap
+-- the Korblox legs use there.
 -- ==========================================================
-local Accessories = {}
+local Catalog = {}
 do
-    Accessories.Templates = {
+    local MarketplaceService = game:GetService("MarketplaceService")
+
+    Catalog.Templates = {
         { Name = "Violet Valkyrie", ID = 1402432199 },
         { Name = "8-Bit Royal Crown", ID = 10159600649 },
         { Name = "Fiery Horns of the Netherworld", ID = 215718515 },
@@ -991,15 +1002,37 @@ do
         { Name = "Poisoned Horns of the Toxic Wasteland", ID = 1744060292 },
     }
 
-    Accessories.OnChange = nil -- called (no arguments) whenever the list of worn accessories changes
+    Catalog.OnChange = nil -- called (no arguments) whenever the set of worn items changes
 
-    local applied = {}  -- [assetId] = true
-    local cache = {}    -- [assetId] = Accessory (kept in memory, never parented)
-    local alive = true
+    -- asset type id -> how it is worn. Slot = only one item per slot at a time.
+    local TYPE_INFO = {
+        [2] = { Kind = "Clothing", Slot = "TShirt", Class = "ShirtGraphic" },
+        [11] = { Kind = "Clothing", Slot = "Shirt", Class = "Shirt" },
+        [12] = { Kind = "Clothing", Slot = "Pants", Class = "Pants" },
+        [18] = { Kind = "Face", Slot = "Face" },
+        [17] = { Kind = "Head", Slot = "Head" },
+        [79] = { Kind = "DynamicHead", Slot = "Head" },
+        [27] = { Kind = "Limb", Slot = "Torso", Parts = { "UpperTorso", "LowerTorso" } },
+        [28] = { Kind = "Limb", Slot = "RightArm", Parts = { "RightUpperArm", "RightLowerArm", "RightHand" } },
+        [29] = { Kind = "Limb", Slot = "LeftArm", Parts = { "LeftUpperArm", "LeftLowerArm", "LeftHand" } },
+        [30] = { Kind = "Limb", Slot = "LeftLeg", Parts = { "LeftUpperLeg", "LeftLowerLeg", "LeftFoot" } },
+        [31] = { Kind = "Limb", Slot = "RightLeg", Parts = { "RightUpperLeg", "RightLowerLeg", "RightFoot" } },
+    }
+    for _, assetType in ipairs({ 8, 41, 42, 43, 44, 45, 46, 47, 64, 65, 66, 67, 68, 69, 70, 71, 72 }) do
+        TYPE_INFO[assetType] = { Kind = "Accessory" }
+    end
+
+    local applied = {}      -- [assetId] = { Info = TYPE_INFO entry, AssetType = number }
+    local slotOwner = {}    -- [slot] = assetId
+    local loadedCache = {}  -- [assetId] = instance returned by GetObjects (kept in memory, never parented)
+    local accessoryCache = {} -- [assetId] = ready-to-wear Accessory
+    local typeCache = {}    -- [assetId] = asset type id, or false when unknown
+    local originals = setmetatable({}, { __mode = "k" }) -- [rig] = what was there before we changed it
     local handledRigs = setmetatable({}, { __mode = "k" })
+    local alive = true
 
     local function Changed()
-        if Accessories.OnChange then task.spawn(Accessories.OnChange) end
+        if Catalog.OnChange then task.spawn(Catalog.OnChange) end
     end
 
     local function GetAllRigs()
@@ -1007,6 +1040,40 @@ do
         return ok and type(list) == "table" and list or {}
     end
 
+    local function Store(rig)
+        originals[rig] = originals[rig] or {}
+        return originals[rig]
+    end
+
+    -- ---------- looking at an item ----------
+    local function IdText(assetId)
+        return string.format("%.0f", assetId)
+    end
+
+    -- May yield (the first time). The asset type id of an item, from the catalog.
+    function Catalog.AssetTypeOf(assetId, hint)
+        if hint then return hint end
+        if typeCache[assetId] ~= nil then return typeCache[assetId] or nil end
+        local ok, info = pcall(function() return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset) end)
+        local assetType = ok and type(info) == "table" and tonumber(info.AssetTypeId) or false
+        typeCache[assetId] = assetType
+        return assetType or nil
+    end
+
+    function Catalog.IsSupportedType(assetType)
+        return TYPE_INFO[assetType] ~= nil
+    end
+
+    local function LoadAsset(assetId)
+        if loadedCache[assetId] then return loadedCache[assetId] end
+        local ok, objects = pcall(function() return game:GetObjects("rbxassetid://" .. IdText(assetId)) end)
+        if not ok or type(objects) ~= "table" or not objects[1] then return nil end
+        for index = 2, #objects do pcall(function() objects[index]:Destroy() end) end
+        loadedCache[assetId] = objects[1]
+        return objects[1]
+    end
+
+    -- ---------- shared helpers (ported from Manager/VisualAccessories.lua) ----------
     local function FindBodyAttachment(character, attachmentName)
         for _, object in ipairs(character:GetDescendants()) do
             if object:IsA("Attachment") and object.Name == attachmentName and object.Parent:IsA("BasePart") then
@@ -1016,11 +1083,81 @@ do
         return nil
     end
 
-    -- Puts one accessory on one rig. Returns true when it was really added.
-    local function EquipOnRig(character, humanoid, cachedAcc, assetId)
+    local function SetMeshProp(part, prop, value)
+        if pcall(function() part[prop] = value end) then return "direct" end
+        if sethiddenproperty and pcall(sethiddenproperty, part, prop, value) then return "sethiddenproperty" end
+        return nil
+    end
+
+    local function ApplyMeshById(part, meshId)
+        local method = SetMeshProp(part, "MeshId", meshId)
+        if method then return method end
+        local okNew, newMesh = pcall(function()
+            return game:GetService("InsertService"):CreateMeshPartAsync(meshId, Enum.CollisionFidelity.Box, Enum.RenderFidelity.Automatic)
+        end)
+        if okNew and newMesh then
+            local okApply = pcall(function() part:ApplyMesh(newMesh) end)
+            newMesh:Destroy()
+            if okApply then return "ApplyMesh" end
+        end
+        return nil
+    end
+
+    local function ReadLook(part)
+        local look = { MeshId = part.MeshId, TextureID = part.TextureID, Color = part.Color, Material = part.Material, Transparency = part.Transparency, Appearance = {} }
+        for _, child in ipairs(part:GetChildren()) do
+            if child:IsA("SurfaceAppearance") then table.insert(look.Appearance, child:Clone()) end
+        end
+        return look
+    end
+
+    local function ApplyLook(dst, look)
+        if not dst:IsA("MeshPart") then return false end
+
+        local meshMethod, texMethod = "same", "same"
+        if dst.MeshId ~= look.MeshId then meshMethod = ApplyMeshById(dst, look.MeshId) end
+        if dst.TextureID ~= look.TextureID then texMethod = SetMeshProp(dst, "TextureID", look.TextureID) end
+        if not meshMethod or not texMethod then return false end
+
+        for _, child in ipairs(dst:GetChildren()) do
+            if child:IsA("SurfaceAppearance") then child:Destroy() end
+        end
+        for _, appearance in ipairs(look.Appearance) do appearance:Clone().Parent = dst end
+
+        pcall(function()
+            dst.Color = look.Color
+            dst.Material = look.Material
+            dst.Transparency = look.Transparency
+        end)
+        return true
+    end
+
+    local function IsR15(humanoid)
+        return humanoid.RigType == Enum.HumanoidRigType.R15
+    end
+
+    -- ---------- accessories ----------
+    local function PrepareAccessory(assetId, loaded)
+        if accessoryCache[assetId] then return accessoryCache[assetId] end
+        local acc = loaded:IsA("Accessory") and loaded or loaded:FindFirstChildWhichIsA("Accessory", true)
+        local handle = acc and acc:FindFirstChild("Handle")
+        if not (handle and handle:IsA("BasePart")) then return nil end
+
+        handle.CanCollide = false
+        handle.CanTouch = false
+        handle.CanQuery = false
+        handle.Massless = true
+        handle.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0, 0, 0)
+        acc:SetAttribute("IsCustomAccessory", true)
+        acc:SetAttribute("AssetId", assetId)
+        accessoryCache[assetId] = acc:Clone()
+        return accessoryCache[assetId]
+    end
+
+    local function EquipAccessory(character, humanoid, cachedAcc, assetId)
         for _, child in ipairs(character:GetChildren()) do
             if child:IsA("Accessory") and child:GetAttribute("AssetId") == assetId then
-                return false
+                return true
             end
         end
 
@@ -1056,95 +1193,320 @@ do
         return true
     end
 
-    function Accessories.IsApplied(assetId)
-        return applied[assetId] == true
+    local function RemoveAccessory(rig, assetId)
+        for _, child in ipairs(rig:GetChildren()) do
+            if child:IsA("Accessory") and child:GetAttribute("AssetId") == assetId then child:Destroy() end
+        end
     end
 
-    function Accessories.AppliedCount()
+    -- ---------- classic clothing ----------
+    local function ApplyClothing(rig, assetId, loaded, info)
+        local source = loaded.ClassName == info.Class and loaded or loaded:FindFirstChildWhichIsA(info.Class, true)
+        if not source then return false end
+
+        local store = Store(rig)
+        local key = "Clothing:" .. info.Class
+        for _, child in ipairs(rig:GetChildren()) do
+            if child.ClassName == info.Class then
+                if not child:GetAttribute("VisualCatalogId") and store[key] == nil then store[key] = child:Clone() end
+                child:Destroy()
+            end
+        end
+
+        local clone = source:Clone()
+        clone:SetAttribute("VisualCatalogId", assetId)
+        clone.Parent = rig
+        return true
+    end
+
+    local function RemoveClothing(rig, assetId, info)
+        for _, child in ipairs(rig:GetChildren()) do
+            if child.ClassName == info.Class and child:GetAttribute("VisualCatalogId") == assetId then child:Destroy() end
+        end
+        local store = Store(rig)
+        local key = "Clothing:" .. info.Class
+        if store[key] then
+            store[key]:Clone().Parent = rig
+            store[key] = nil
+        end
+    end
+
+    -- ---------- face ----------
+    local function FaceDecal(head)
+        return head:FindFirstChild("face") or head:FindFirstChildWhichIsA("Decal")
+    end
+
+    local function ApplyFace(rig, assetId, loaded)
+        local head = rig:FindFirstChild("Head")
+        local source = loaded:IsA("Decal") and loaded or loaded:FindFirstChildWhichIsA("Decal", true)
+        if not (head and source) then return false end
+
+        local store = Store(rig)
+        local face = FaceDecal(head)
+        if face then
+            if store.Face == nil then store.Face = { Decal = face, Texture = face.Texture } end
+            face.Texture = source.Texture
+        else
+            local clone = source:Clone()
+            clone.Name = "face"
+            clone:SetAttribute("VisualCatalogId", assetId)
+            clone.Parent = head
+        end
+        return true
+    end
+
+    local function RemoveFace(rig, assetId)
+        local store = Store(rig)
+        if store.Face then
+            if store.Face.Decal.Parent then store.Face.Decal.Texture = store.Face.Texture end
+            store.Face = nil
+        end
+        local head = rig:FindFirstChild("Head")
+        local face = head and head:FindFirstChild("face")
+        if face and face:GetAttribute("VisualCatalogId") == assetId then face:Destroy() end
+    end
+
+    -- ---------- head (classic head or the mesh of a dynamic head) ----------
+    local function ApplyHead(rig, assetId, loaded)
+        local head = rig:FindFirstChild("Head")
+        if not head then return false end
+
+        local source = loaded:IsA("MeshPart") and loaded
+            or loaded:FindFirstChildWhichIsA("SpecialMesh", true)
+            or loaded:FindFirstChildWhichIsA("MeshPart", true)
+        if not source then return false end
+
+        local store = Store(rig)
+        if head:IsA("MeshPart") then
+            if not store.HeadLook then store.HeadLook = ReadLook(head) end
+            local look
+            if source:IsA("SpecialMesh") then
+                look = { MeshId = source.MeshId, TextureID = source.TextureId, Color = head.Color, Material = head.Material, Transparency = head.Transparency, Appearance = {} }
+            else
+                look = ReadLook(source)
+            end
+            return ApplyLook(head, look)
+        end
+
+        -- classic rig: the Head part has a SpecialMesh
+        if not source:IsA("SpecialMesh") then return false end
+        local mesh = head:FindFirstChildWhichIsA("SpecialMesh")
+        if not mesh then
+            mesh = Instance.new("SpecialMesh")
+            mesh:SetAttribute("VisualCatalogMade", true)
+            mesh.Parent = head
+        end
+        if not store.HeadMesh then
+            store.HeadMesh = { Mesh = mesh, Made = mesh:GetAttribute("VisualCatalogMade") == true, MeshType = mesh.MeshType, MeshId = mesh.MeshId, TextureId = mesh.TextureId, Scale = mesh.Scale, Offset = mesh.Offset }
+        end
+        mesh.MeshType = Enum.MeshType.FileMesh
+        mesh.MeshId = source.MeshId
+        mesh.TextureId = source.TextureId
+        mesh.Scale = source.Scale
+        mesh.Offset = source.Offset
+        return true
+    end
+
+    local function RemoveHead(rig)
+        local store = Store(rig)
+        local head = rig:FindFirstChild("Head")
+        if store.HeadLook and head then
+            ApplyLook(head, store.HeadLook)
+        end
+        store.HeadLook = nil
+
+        local saved = store.HeadMesh
+        if saved and saved.Mesh.Parent then
+            if saved.Made then
+                saved.Mesh:Destroy()
+            else
+                saved.Mesh.MeshType = saved.MeshType
+                saved.Mesh.MeshId = saved.MeshId
+                saved.Mesh.TextureId = saved.TextureId
+                saved.Mesh.Scale = saved.Scale
+                saved.Mesh.Offset = saved.Offset
+            end
+        end
+        store.HeadMesh = nil
+    end
+
+    -- ---------- body parts ----------
+    local function ApplyLimb(rig, humanoid, assetId, loaded, info)
+        local store = Store(rig)
+        local changed = false
+
+        if IsR15(humanoid) then
+            store.Looks = store.Looks or {}
+            for _, name in ipairs(info.Parts) do
+                local source = (loaded:IsA("MeshPart") and loaded.Name == name) and loaded or loaded:FindFirstChild(name, true)
+                local dst = rig:FindFirstChild(name)
+                if source and dst and source:IsA("MeshPart") and dst:IsA("MeshPart") then
+                    if not store.Looks[dst] then store.Looks[dst] = ReadLook(dst) end
+                    if ApplyLook(dst, ReadLook(source)) then changed = true end
+                end
+            end
+        else
+            -- R6 rigs take CharacterMesh objects
+            local meshes = {}
+            if loaded:IsA("CharacterMesh") then table.insert(meshes, loaded) end
+            for _, descendant in ipairs(loaded:GetDescendants()) do
+                if descendant:IsA("CharacterMesh") then table.insert(meshes, descendant) end
+            end
+            store.CharacterMeshes = store.CharacterMeshes or {}
+            for _, mesh in ipairs(meshes) do
+                for _, existing in ipairs(rig:GetChildren()) do
+                    if existing:IsA("CharacterMesh") and existing.BodyPart == mesh.BodyPart then
+                        if not existing:GetAttribute("VisualCatalogId") then table.insert(store.CharacterMeshes, existing:Clone()) end
+                        existing:Destroy()
+                    end
+                end
+                local clone = mesh:Clone()
+                clone:SetAttribute("VisualCatalogId", assetId)
+                clone.Parent = rig
+                changed = true
+            end
+        end
+        return changed
+    end
+
+    local function RemoveLimb(rig, humanoid, assetId, info)
+        local store = Store(rig)
+        if IsR15(humanoid) then
+            for _, name in ipairs(info.Parts) do
+                local dst = rig:FindFirstChild(name)
+                if dst and store.Looks and store.Looks[dst] then
+                    ApplyLook(dst, store.Looks[dst])
+                    store.Looks[dst] = nil
+                end
+            end
+        else
+            for _, child in ipairs(rig:GetChildren()) do
+                if child:IsA("CharacterMesh") and child:GetAttribute("VisualCatalogId") == assetId then child:Destroy() end
+            end
+            for _, saved in ipairs(store.CharacterMeshes or {}) do
+                local taken = false
+                for _, existing in ipairs(rig:GetChildren()) do
+                    if existing:IsA("CharacterMesh") and existing.BodyPart == saved.BodyPart then taken = true end
+                end
+                if not taken then saved:Clone().Parent = rig end
+            end
+            store.CharacterMeshes = nil
+        end
+    end
+
+    -- ---------- one item on one rig ----------
+    local function SourceOf(assetId, info)
+        if info.Kind == "Accessory" then return accessoryCache[assetId] end
+        return loadedCache[assetId]
+    end
+
+    local function ApplyToRig(entry, assetId, rig, humanoid)
+        local info = entry.Info
+        local source = SourceOf(assetId, info)
+        if not source then return false end
+
+        if info.Kind == "Accessory" then return EquipAccessory(rig, humanoid, source, assetId) end
+        if info.Kind == "Clothing" then return ApplyClothing(rig, assetId, source, info) end
+        if info.Kind == "Face" then return ApplyFace(rig, assetId, source) end
+        if info.Kind == "Head" or info.Kind == "DynamicHead" then return ApplyHead(rig, assetId, source) end
+        if info.Kind == "Limb" then return ApplyLimb(rig, humanoid, assetId, source, info) end
+        return false
+    end
+
+    local function RemoveFromRig(entry, assetId, rig, humanoid)
+        local info = entry.Info
+        if info.Kind == "Accessory" then RemoveAccessory(rig, assetId) end
+        if info.Kind == "Clothing" then RemoveClothing(rig, assetId, info) end
+        if info.Kind == "Face" then RemoveFace(rig, assetId) end
+        if info.Kind == "Head" or info.Kind == "DynamicHead" then RemoveHead(rig) end
+        if info.Kind == "Limb" then RemoveLimb(rig, humanoid, assetId, info) end
+    end
+
+    -- ---------- API ----------
+    function Catalog.IsApplied(assetId)
+        return applied[assetId] ~= nil
+    end
+
+    function Catalog.AppliedCount()
         local count = 0
         for _ in pairs(applied) do count = count + 1 end
         return count
     end
 
-    -- May yield (the asset is downloaded the first time). Returns true, message or false, reason.
-    function Accessories.Apply(assetId)
+    local function RemoveInternal(assetId)
+        local entry = applied[assetId]
+        if not entry then return end
+        for _, rigEntry in ipairs(GetAllRigs()) do
+            pcall(RemoveFromRig, entry, assetId, rigEntry.Rig, rigEntry.Humanoid)
+        end
+        applied[assetId] = nil
+        if entry.Info.Slot and slotOwner[entry.Info.Slot] == assetId then slotOwner[entry.Info.Slot] = nil end
+    end
+
+    -- May yield (type lookup and download the first time). assetTypeHint skips the type lookup when the caller
+    -- already knows it. Returns true, message or false, reason.
+    function Catalog.Apply(assetId, assetTypeHint)
         local rigs = GetAllRigs()
         if #rigs == 0 then return false, "No character found yet. Wait until you have spawned." end
 
-        local cachedAcc = cache[assetId]
-        if not cachedAcc then
-            local success, objects = pcall(function() return game:GetObjects("rbxassetid://" .. tostring(assetId)) end)
-            if success and objects and objects[1] then
-                local loaded = objects[1]
-                local acc = loaded:IsA("Accessory") and loaded or loaded:FindFirstChildWhichIsA("Accessory", true)
-                if acc then
-                    local handle = acc:FindFirstChild("Handle")
-                    if handle and handle:IsA("BasePart") then
-                        handle.CanCollide = false
-                        handle.CanTouch = false
-                        handle.CanQuery = false
-                        handle.Massless = true
-                        handle.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0, 0, 0)
-                        acc:SetAttribute("IsCustomAccessory", true)
-                        acc:SetAttribute("AssetId", assetId)
-
-                        cache[assetId] = acc:Clone()
-                        cachedAcc = cache[assetId]
-                    end
-                end
-                loaded:Destroy()
-            end
+        local assetType = Catalog.AssetTypeOf(assetId, assetTypeHint)
+        local info = assetType and TYPE_INFO[assetType]
+        if not info then
+            return false, assetType and ("This item type (" .. assetType .. ") can not be worn here yet.") or "Could not read this item from the catalog."
         end
 
-        if not cachedAcc then return false, "Could not load that asset. Make sure it is an accessory ID." end
-
-        for _, entry in ipairs(rigs) do
-            EquipOnRig(entry.Rig, entry.Humanoid, cachedAcc, assetId)
+        local loaded = LoadAsset(assetId)
+        if not loaded then return false, "Could not load that asset." end
+        if info.Kind == "Accessory" and not PrepareAccessory(assetId, loaded) then
+            return false, "Could not load that asset. Make sure it is an accessory ID."
         end
 
-        applied[assetId] = true
+        -- a slot holds one item: the item that was in it goes back first
+        if info.Slot and slotOwner[info.Slot] and slotOwner[info.Slot] ~= assetId then
+            RemoveInternal(slotOwner[info.Slot])
+        end
+
+        local entry = { Info = info, AssetType = assetType }
+        local worn = false
+        for _, rigEntry in ipairs(rigs) do
+            local ok, result = pcall(ApplyToRig, entry, assetId, rigEntry.Rig, rigEntry.Humanoid)
+            if ok and result then worn = true end
+        end
+        if not worn then return false, "This item did not fit the character (" .. info.Kind .. ")." end
+
+        applied[assetId] = entry
+        if info.Slot then slotOwner[info.Slot] = assetId end
         Changed()
-        return true, "Accessory equipped."
+        return true, "Equipped."
     end
 
-    function Accessories.Remove(assetId)
-        applied[assetId] = nil
-        for _, entry in ipairs(GetAllRigs()) do
-            for _, child in ipairs(entry.Rig:GetChildren()) do
-                if child:IsA("Accessory") and child:GetAttribute("AssetId") == assetId then child:Destroy() end
-            end
-        end
+    function Catalog.Remove(assetId)
+        RemoveInternal(assetId)
         Changed()
     end
 
-    -- Removes every accessory added here. Returns how many were removed from the rigs.
-    function Accessories.Clear()
-        applied = {}
+    -- Takes everything off. Returns how many items were worn.
+    function Catalog.Clear()
         local count = 0
-        for _, entry in ipairs(GetAllRigs()) do
-            for _, child in ipairs(entry.Rig:GetChildren()) do
-                if child:IsA("Accessory") and child:GetAttribute("IsCustomAccessory") then
-                    child:Destroy()
-                    count = count + 1
-                end
-            end
+        for assetId in pairs(table.clone(applied)) do
+            RemoveInternal(assetId)
+            count = count + 1
         end
         Changed()
         return count
     end
 
-    -- A new rig (respawn, or a rig the game rebuilt) gets every active accessory again.
+    -- A new rig (respawn, or a rig the game rebuilt) gets everything that is worn again.
     task.spawn(function()
         while alive do
             task.wait(1)
-            for _, entry in ipairs(GetAllRigs()) do
-                if not handledRigs[entry.Rig] then
-                    handledRigs[entry.Rig] = true
+            for _, rigEntry in ipairs(GetAllRigs()) do
+                if not handledRigs[rigEntry.Rig] then
+                    handledRigs[rigEntry.Rig] = true
                     task.wait(0.5)
-                    if alive and entry.Rig.Parent then
-                        for assetId in pairs(table.clone(applied)) do
-                            local cachedAcc = cache[assetId]
-                            if cachedAcc then pcall(EquipOnRig, entry.Rig, entry.Humanoid, cachedAcc, assetId) end
+                    if alive and rigEntry.Rig.Parent then
+                        for assetId, entry in pairs(table.clone(applied)) do
+                            pcall(ApplyToRig, entry, assetId, rigEntry.Rig, rigEntry.Humanoid)
                         end
                     end
                 end
@@ -1154,8 +1516,8 @@ do
 
     RegisterCleanup(function()
         alive = false
-        Accessories.OnChange = nil
-        pcall(Accessories.Clear)
+        Catalog.OnChange = nil
+        pcall(Catalog.Clear)
     end)
 end
 
@@ -1165,13 +1527,13 @@ end
 -- ==========================================================
 Shell = GetShell()
 Page = Shell:AddPage({
-    Id = "Accessories",
-    Title = "Visual Accessories",
-    TabTitle = "Accessories",
-    Letter = "A",
+    Id = "Catalog",
+    Title = "Visual Catalog",
+    TabTitle = "Catalog",
+    Letter = "C",
     Order = 4,
-    Width = 430,
-    Height = 560,
+    Width = 470,
+    Height = 640,
     Cleanup = ModuleCleanup,
 })
 local PageLayout = BuildPageLayout(Page.Frame)
@@ -1182,11 +1544,12 @@ RemoveAllButton.Frame.AnchorPoint = Vector2.new(1, 0.5)
 RemoveAllButton.Frame.Position = UDim2.new(1, -12, 0.5, 0)
 
 -- ==========================================================
--- Accessories browser (same look as Visual Unusual). Every cell shows the accessory's picture (loaded from
--- its asset id). The list comes from the Roblox catalog (accessories only): pick a type in the row at the top,
--- search by keyword, change the order, and more load as you scroll. "Featured" holds the hub's templates and
--- anything added by asset id. Catalog access needs the executor's request function; without it the script
--- falls back to Featured.
+-- Catalog browser (same look as Visual Unusual). Every cell shows the item's picture (loaded from its id).
+-- Pick a group (Accessories / Clothing / Body) and a type in the rows at the top, search by keyword, change the
+-- order, and more load as you scroll. Bundles (full bodies, dynamic heads, shoes) open into their parts, which
+-- are worn one by one or all at once. "Featured" holds the hub's templates and anything added by asset id.
+-- The list comes from the game's own catalog (AvatarEditorService); the web catalog is the fallback and needs
+-- the executor's request function.
 -- ==========================================================
 local MarketplaceService = game:GetService("MarketplaceService")
 
@@ -1201,22 +1564,45 @@ local REQUEST_GAP = 0.9 -- seconds between two catalog requests; Roblox answers 
 local HOSTS = { "https://catalog.roblox.com", "https://catalog.roproxy.com" }
 local BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
--- Catalog types. Category 11 is Accessories and Sub narrows it to one slot (hair lives under Body, 18) for the web
--- catalog; AssetTypes are the asset type numbers the game's own catalog (AvatarEditorService) takes:
--- 8 Hat, 41 Hair, 42 Face, 43 Neck, 44 Shoulder, 45 Front, 46 Back, 47 Waist.
-local ALL_ACCESSORIES = { 8, 41, 42, 43, 44, 45, 46, 47 }
-local TYPES = {
-    { Key = "Featured", Title = "Featured" },
-    { Key = "All", Title = "All", Category = 11, AssetTypes = ALL_ACCESSORIES },
-    { Key = "Head", Title = "Head", Category = 11, Sub = 54, AssetTypes = { 8 } },
-    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20, AssetTypes = { 41 } },
-    { Key = "Face", Title = "Face", Category = 11, Sub = 21, AssetTypes = { 42 } },
-    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22, AssetTypes = { 43 } },
-    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23, AssetTypes = { 44 } },
-    { Key = "Front", Title = "Front", Category = 11, Sub = 24, AssetTypes = { 45 } },
-    { Key = "Back", Title = "Back", Category = 11, Sub = 25, AssetTypes = { 46 } },
-    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26, AssetTypes = { 47 } },
+-- Groups and types. Category / Sub are the web catalog's filters; AssetTypes are the asset type numbers the game's
+-- own catalog takes (8 hat, 41 hair, 42 face, 43 neck, 44 shoulder, 45 front, 46 back, 47 waist, 11 shirt,
+-- 12 pants, 2 t-shirt, 64-72 layered clothing, 17 head, 18 face); Bundle is a bundle type (1 body, 3 shoes,
+-- 4 dynamic head) instead.
+local GROUPS = {
+    { Title = "Featured" },
+    { Title = "Accessories", Types = {
+        { Title = "All", Category = 11, AssetTypes = { 8, 42, 43, 44, 45, 46, 47 } },
+        { Title = "Head", Category = 11, Sub = 54, AssetTypes = { 8 } },
+        { Title = "Hair", Category = 18, Sub = 20, AssetTypes = { 41 } },
+        { Title = "Face", Category = 11, Sub = 21, AssetTypes = { 42 } },
+        { Title = "Neck", Category = 11, Sub = 22, AssetTypes = { 43 } },
+        { Title = "Shoulder", Category = 11, Sub = 23, AssetTypes = { 44 } },
+        { Title = "Front", Category = 11, Sub = 24, AssetTypes = { 45 } },
+        { Title = "Back", Category = 11, Sub = 25, AssetTypes = { 46 } },
+        { Title = "Waist", Category = 11, Sub = 26, AssetTypes = { 47 } },
+    } },
+    { Title = "Clothing", Types = {
+        { Title = "All", Category = 3, AssetTypes = { 11, 2, 12, 64, 65, 66, 67, 68, 69, 72 } },
+        { Title = "Classic Shirt", Category = 3, Sub = 56, AssetTypes = { 11 } },
+        { Title = "Classic Pants", Category = 3, Sub = 57, AssetTypes = { 12 } },
+        { Title = "Classic T-Shirt", Category = 3, Sub = 55, AssetTypes = { 2 } },
+        { Title = "Shirt 3D", Category = 3, Sub = 59, AssetTypes = { 65 } },
+        { Title = "Pants 3D", Category = 3, Sub = 60, AssetTypes = { 66 } },
+        { Title = "T-Shirt 3D", Category = 3, Sub = 58, AssetTypes = { 64 } },
+        { Title = "Jacket 3D", Category = 3, Sub = 61, AssetTypes = { 67 } },
+        { Title = "Sweater 3D", Category = 3, Sub = 62, AssetTypes = { 68 } },
+        { Title = "Shorts 3D", Category = 3, Sub = 63, AssetTypes = { 69 } },
+        { Title = "Dress 3D", Category = 3, Sub = 65, AssetTypes = { 72 } },
+        { Title = "Shoes", Category = 3, Sub = 64, Bundle = 3 },
+    } },
+    { Title = "Body", Types = {
+        { Title = "Full Bodies", Category = 18, Sub = 37, Bundle = 1 },
+        { Title = "Dynamic Heads", Category = 18, Sub = 66, Bundle = 4 },
+        { Title = "Classic Heads", Category = 18, Sub = 15, AssetTypes = { 17 } },
+        { Title = "Classic Faces", Category = 18, Sub = 10, AssetTypes = { 18 } },
+    } },
 }
+local DEFAULT_GROUP = 2 -- Accessories, "All", most popular first
 
 local SORTS = {
     { Name = "Relevance", Type = 0, Engine = "Relevance" },
@@ -1228,8 +1614,9 @@ local SORTS = {
 }
 local DEFAULT_SORT, SEARCH_SORT = 2, 1
 
-local function ThumbnailOf(assetId)
-    return "rbxthumb://type=Asset&id=" .. string.format("%.0f", assetId) .. "&w=150&h=150"
+local function ThumbnailOf(entry)
+    local kind = entry.IsBundle and "BundleThumbnail" or "Asset"
+    return "rbxthumb://type=" .. kind .. "&id=" .. string.format("%.0f", entry.Id) .. "&w=150&h=150"
 end
 
 local function ParseId(text)
@@ -1350,26 +1737,39 @@ local function CatalogUrl(typeInfo, keyword, sort, cursor)
     return "/v1/search/items/details?" .. table.concat(parts, "&")
 end
 
+
 -- ---------- the game's own catalog (AvatarEditorService, no HTTP involved) ----------
 -- Tried first: it is the catalog the Roblox avatar editor uses and needs no request function. If it is unusable
 -- here (errors three times) the web catalog above takes over for the rest of the session.
 local engineBroken, engineFailures = false, 0
 
+local function EnumNamed(enumType, name)
+    for _, item in ipairs(enumType:GetEnumItems()) do
+        if item.Name == name then return item end
+    end
+    return nil
+end
+
+local function EnumValued(enumType, values)
+    local list = {}
+    for _, item in ipairs(enumType:GetEnumItems()) do
+        if table.find(values, item.Value) then table.insert(list, item) end
+    end
+    return list
+end
+
 local function EngineStart(typeInfo, keyword, sort)
     local params = CatalogSearchParams.new()
     if keyword ~= "" then params.SearchKeyword = keyword end
     -- enum items are found by their number, so a renamed item cannot break the lookup
-    local assetTypes = {}
-    for _, item in ipairs(Enum.AvatarAssetType:GetEnumItems()) do
-        if table.find(typeInfo.AssetTypes, item.Value) then table.insert(assetTypes, item) end
-    end
-    if #assetTypes == 0 then error("no matching AvatarAssetType") end
-    params.AssetTypes = assetTypes
-    local function EnumNamed(enumType, name)
-        for _, item in ipairs(enumType:GetEnumItems()) do
-            if item.Name == name then return item end
-        end
-        return nil
+    if typeInfo.Bundle then
+        local bundleTypes = EnumValued(Enum.BundleType, { typeInfo.Bundle })
+        if #bundleTypes == 0 then error("no matching BundleType") end
+        params.BundleTypes = bundleTypes
+    else
+        local assetTypes = EnumValued(Enum.AvatarAssetType, typeInfo.AssetTypes)
+        if #assetTypes == 0 then error("no matching AvatarAssetType") end
+        params.AssetTypes = assetTypes
     end
     local sortType = EnumNamed(Enum.CatalogSortType, sort.Engine)
     if sortType then params.SortType = sortType end
@@ -1380,22 +1780,23 @@ local function EngineStart(typeInfo, keyword, sort)
     return game:GetService("AvatarEditorService"):SearchCatalog(params)
 end
 
-local function EngineItems(pages)
+local function EngineItems(pages, wantBundles)
     local list = {}
     for _, item in ipairs(pages:GetCurrentPage()) do
         local id, name = item.Id, item.Name
         local isBundle = string.find(tostring(item.ItemType or ""), "Bundle", 1, true) ~= nil
-        if type(id) == "number" and type(name) == "string" and not isBundle then
-            table.insert(list, { Id = id, Name = name, Price = item.Price, Creator = item.CreatorName })
+        if type(id) == "number" and type(name) == "string" and isBundle == wantBundles then
+            table.insert(list, { Id = id, Name = name, IsBundle = isBundle, Price = item.Price, Creator = item.CreatorName })
         end
     end
     return list
 end
 
--- May yield. Returns items (a list of { Id, Name, Price, Status, Creator }) and whether it was the last page,
--- or nil, nil, a failure kind ("no-request", "rate", "failed") and a detail text. The view keeps the state of its
--- source (pages / cursor), so the next call returns the next page.
+-- May yield. Returns items (a list of { Id, Name, IsBundle, AssetType, Price, Status, Creator }) and whether it was the
+-- last page, or nil, nil, a failure kind ("no-request", "rate", "failed") and a detail text. The view keeps the state
+-- of its source (pages / cursor), so the next call returns the next page.
 local function FetchPage(view, typeInfo, keyword, sort)
+    local wantBundles = typeInfo.Bundle ~= nil
     local engineDetail
     if not engineBroken and view.Backend ~= "web" then
         Throttle()
@@ -1405,7 +1806,7 @@ local function FetchPage(view, typeInfo, keyword, sort)
             elseif not view.Pages.IsFinished then
                 view.Pages:AdvanceToNextPageAsync()
             end
-            return { Items = EngineItems(view.Pages), Done = view.Pages.IsFinished == true }
+            return { Items = EngineItems(view.Pages, wantBundles), Done = view.Pages.IsFinished == true }
         end)
         if ok then
             view.Backend = "engine"
@@ -1426,32 +1827,71 @@ local function FetchPage(view, typeInfo, keyword, sort)
 
     local list = {}
     for _, item in ipairs(type(data.data) == "table" and data.data or {}) do
-        if type(item.id) == "number" and type(item.name) == "string" then
-            table.insert(list, { Id = item.id, Name = item.name, Price = item.price, Status = item.priceStatus, Creator = item.creatorName })
+        local isBundle = item.itemType == "Bundle"
+        if type(item.id) == "number" and type(item.name) == "string" and isBundle == wantBundles then
+            table.insert(list, {
+                Id = item.id, Name = item.name, IsBundle = isBundle, AssetType = (not isBundle) and tonumber(item.assetType) or nil,
+                Price = item.price, Status = item.priceStatus, Creator = item.creatorName,
+            })
         end
     end
     view.Cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or nil
     return list, view.Cursor == nil
 end
 
-local function BuildAccessoriesUI()
-    local entryById = {}
+-- May yield. The parts of a bundle: a list of { Id, Name } (assets only). From the game's catalog first, then the web.
+local function FetchBundleParts(bundleId)
+    local parts = {}
+
+    local ok, details = pcall(function()
+        local itemType = EnumNamed(Enum.AvatarItemType, "Bundle")
+        return game:GetService("AvatarEditorService"):GetItemDetails(bundleId, itemType)
+    end)
+    if ok and type(details) == "table" and type(details.BundledItems) == "table" then
+        for _, item in ipairs(details.BundledItems) do
+            local itemType = tostring(item.Type or item.ItemType or "Asset")
+            if type(item.Id) == "number" and not string.find(itemType, "Outfit", 1, true) then
+                table.insert(parts, { Id = item.Id, Name = tostring(item.Name or ("Item " .. item.Id)) })
+            end
+        end
+    end
+
+    if #parts == 0 then
+        local data = CatalogGet("/v1/bundles/details?bundleIds=" .. string.format("%.0f", bundleId))
+        local bundle = type(data) == "table" and data[1]
+        for _, item in ipairs(type(bundle) == "table" and type(bundle.items) == "table" and bundle.items or {}) do
+            if type(item.id) == "number" and (item.type == nil or item.type == "Asset") then
+                table.insert(parts, { Id = item.id, Name = tostring(item.name or ("Item " .. item.id)) })
+            end
+        end
+    end
+    return parts
+end
+
+local function BuildCatalogUI()
+    local entryByKey = {}
     local featured = {}
+    local bundleParts = {} -- [bundleId] = list of part entries, once a bundle has been opened
     local side = { Query = "", TileList = {}, TileByEntry = {} }
-    local view = { Type = 1, Entries = {}, Cursor = nil, Pages = nil, Backend = nil, Loading = false, Done = false, Failed = false, RetryAt = 0, Token = 0 }
+    local view = {
+        Group = 1, TypeIndex = 1, Bundle = nil, BundleEntries = nil,
+        Entries = {}, Cursor = nil, Pages = nil, Backend = nil,
+        Loading = false, Done = false, Failed = false, RetryAt = 0, Token = 0,
+    }
     local sortIndex, sortChosen = DEFAULT_SORT, false
     local statusUntil = 0
-    local PaintAll, Render, LoadMore, SelectType, UpdateRow
+    local PaintAll, Render, LoadMore, SelectGroup, SelectType, UpdateRow, Layout, OpenBundle, ResetBrowse
 
-    -- one entry per asset id, shared by Featured and every catalog result
-    local function GetEntry(assetId, name, extra)
-        local entry = entryById[assetId]
+    -- one entry per item (assets and bundles are numbered separately), shared by Featured and every result
+    local function GetEntry(id, name, extra)
+        local key = ((extra and extra.IsBundle) and "b" or "a") .. string.format("%.0f", id)
+        local entry = entryByKey[key]
         if not entry then
-            entry = { Id = assetId, Name = name }
-            entryById[assetId] = entry
+            entry = { Id = id, Name = name }
+            entryByKey[key] = entry
         end
         if name and name ~= "" and not entry.Pinned then entry.Name = name end
-        for key, value in pairs(extra or {}) do entry[key] = value end
+        for field, value in pairs(extra or {}) do entry[field] = value end
         return entry
     end
 
@@ -1459,17 +1899,22 @@ local function BuildAccessoriesUI()
         if not table.find(featured, entry) then table.insert(featured, entry) end
     end
 
-    for _, template in ipairs(Accessories.Templates) do
-        local entry = GetEntry(template.ID, template.Name, { Pinned = true })
-        Feature(entry)
+    for _, template in ipairs(Catalog.Templates) do
+        Feature(GetEntry(template.ID, template.Name, { Pinned = true }))
+    end
+
+    local function Browsing()
+        return GROUPS[view.Group].Types ~= nil and view.Bundle == nil
     end
 
     local function ShowHint()
-        local count = Accessories.AppliedCount()
-        if count == 0 then
-            StatusLabel.Text = "Pick an accessory, or paste an asset ID."
+        local count = Catalog.AppliedCount()
+        if view.Bundle then
+            StatusLabel.Text = "Pick the parts of " .. view.Bundle.Name .. " to wear, or all of them."
+        elseif count == 0 then
+            StatusLabel.Text = "Pick an item, or paste an asset ID."
         else
-            StatusLabel.Text = "Wearing " .. count .. " accessor" .. (count == 1 and "y" or "ies") .. ". Pick one again to take it off."
+            StatusLabel.Text = "Wearing " .. count .. " item" .. (count == 1 and "" or "s") .. ". Pick one again to take it off."
         end
         StatusLabel.TextColor3 = THEME.SubText
     end
@@ -1483,9 +1928,19 @@ local function BuildAccessoriesUI()
         end)
     end
 
+    local function BundleWorn(entry)
+        local parts = bundleParts[entry.Id]
+        if not parts or #parts == 0 then return false end
+        for _, part in ipairs(parts) do
+            if not Catalog.IsApplied(part.Id) then return false end
+        end
+        return true
+    end
+
     -- ---------- cells ----------
     local function PaintTile(tile, hovered)
-        local on = Accessories.IsApplied(tile.Entry.Id)
+        local entry = tile.Entry
+        local on = entry.IsBundle and BundleWorn(entry) or (not entry.IsBundle and Catalog.IsApplied(entry.Id))
         tile.Button.BackgroundTransparency = on and 0.82 or (hovered and 0.9 or 0.95)
         tile.Badge.Visible = on
         tile.Stroke.Color = on and THEME.Accent or THEME.Stroke
@@ -1493,23 +1948,32 @@ local function BuildAccessoriesUI()
         tile.Stroke.Thickness = on and 1.5 or 1
     end
 
+    local BundleAction
+
     PaintAll = function()
         for _, tile in ipairs(side.TileList) do PaintTile(tile, false) end
-        local count = Accessories.AppliedCount()
+        local count = Catalog.AppliedCount()
         side.CountLabel.Text = "Applied: " .. count
         side.CountLabel.TextColor3 = count > 0 and THEME.Text or THEME.Muted
+        if BundleAction then
+            BundleAction.Label.Text = (view.Bundle and BundleWorn(view.Bundle)) and "Take off all" or "Wear all"
+        end
         if os.clock() >= statusUntil then ShowHint() end
     end
 
     local function Toggle(entry)
-        if Accessories.IsApplied(entry.Id) then
-            Accessories.Remove(entry.Id)
+        if entry.IsBundle then
+            OpenBundle(entry)
+            return
+        end
+        if Catalog.IsApplied(entry.Id) then
+            Catalog.Remove(entry.Id)
             PaintAll()
             return
         end
         SetStatus("Applying " .. entry.Name .. "...")
         task.spawn(function()
-            local ok, message = Accessories.Apply(entry.Id)
+            local ok, message = Catalog.Apply(entry.Id, entry.AssetType)
             PaintAll()
             if ok then
                 SetStatus(entry.Name .. " equipped.", THEME.Success)
@@ -1554,7 +2018,7 @@ local function BuildAccessoriesUI()
             Position = UDim2.fromScale(0.5, 0.5),
             Size = UDim2.new(1, -6, 1, -6),
             BackgroundTransparency = 1,
-            Image = ThumbnailOf(entry.Id),
+            Image = ThumbnailOf(entry),
             ScaleType = Enum.ScaleType.Fit,
         }, thumb)
 
@@ -1573,6 +2037,26 @@ local function BuildAccessoriesUI()
         })
         Round(price, 5)
         New("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, price)
+
+        -- bundles are marked: opening one shows its parts
+        if entry.IsBundle then
+            local tag = Label(thumb, {
+                Text = "BUNDLE",
+                Font = FONT_TITLE,
+                TextSize = 9,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextColor3 = THEME.OnAccent,
+                BackgroundTransparency = 0,
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                AnchorPoint = Vector2.new(0, 1),
+                AutomaticSize = Enum.AutomaticSize.X,
+                Position = UDim2.new(0, 4, 1, -4),
+                Size = UDim2.fromOffset(0, 14),
+                ZIndex = 2,
+            })
+            Round(tag, 5)
+            New("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, tag)
+        end
 
         local name = Label(button, {
             Text = entry.Name,
@@ -1604,9 +2088,10 @@ local function BuildAccessoriesUI()
         return tile
     end
 
-    -- The list shown now: Featured (filtered by the typed text) or the catalog results of this type.
+    -- The list shown now: the parts of an open bundle, Featured (filtered by the typed text), or catalog results.
     local function CurrentList()
-        if view.Type == 1 then
+        if view.Bundle then return view.BundleEntries or {} end
+        if GROUPS[view.Group].Types == nil then
             local query = string.lower(side.Query)
             if query == "" then return featured end
             local list = {}
@@ -1647,19 +2132,19 @@ local function BuildAccessoriesUI()
     end
 
     LoadMore = function()
-        if view.Type == 1 or view.Loading or view.Done then return end
+        if not Browsing() or view.Loading or view.Done then return end
         if view.Failed then
             if os.clock() < view.RetryAt then return end
             view.Failed = false
         end
         view.Loading = true
         local mine = view.Token
-        local typeInfo = TYPES[view.Type]
+        local typeInfo = GROUPS[view.Group].Types[view.TypeIndex]
         local keyword = string.match(side.Query, "^%s*(.-)%s*$")
         local sort = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
         if keyword == "" and sort.Type == 0 then sort = SORTS[DEFAULT_SORT] end
 
-        SetStatus("Loading accessories...", THEME.SubText, 30)
+        SetStatus("Loading catalog...", THEME.SubText, 30)
         local items, done, reason, detail = FetchPage(view, typeInfo, keyword, sort)
         if mine ~= view.Token then return end
         view.Loading = false
@@ -1667,10 +2152,10 @@ local function BuildAccessoriesUI()
         if not items then
             view.Failed = true
             view.RetryAt = os.clock() + 5
-            if detail then warn("[Visual Accessories] catalog: " .. tostring(detail)) end
+            if detail then warn("[Visual Catalog] catalog: " .. tostring(detail)) end
             if reason == "no-request" then
                 SetStatus("Catalog browsing is unavailable here: the game catalog failed and this executor has no request function.", THEME.Danger, 8)
-                if view.Type ~= 1 then SelectType(1) end
+                if view.Group ~= 1 then SelectGroup(1) end
             elseif reason == "rate" then
                 SetStatus("Roblox is limiting catalog requests. Try again in a moment.", THEME.Danger, 6)
             else
@@ -1680,14 +2165,16 @@ local function BuildAccessoriesUI()
         end
 
         for _, item in ipairs(items) do
-            local entry = GetEntry(item.Id, item.Name, { Price = item.Price, Status = item.Status, Creator = item.Creator })
+            local entry = GetEntry(item.Id, item.Name, {
+                IsBundle = item.IsBundle, AssetType = item.AssetType, Price = item.Price, Status = item.Status, Creator = item.Creator,
+            })
             if not table.find(view.Entries, entry) then table.insert(view.Entries, entry) end
         end
         view.Done = done
 
         Render()
         if #view.Entries == 0 then
-            SetStatus("No accessories found.", THEME.SubText)
+            SetStatus("Nothing found.", THEME.SubText)
         else
             statusUntil = 0
             ShowHint()
@@ -1696,7 +2183,7 @@ local function BuildAccessoriesUI()
         if not view.Done and NeedsMore() then task.defer(LoadMore) end
     end
 
-    local function ResetBrowse()
+    ResetBrowse = function()
         view.Token = view.Token + 1
         view.Entries, view.Cursor, view.Pages, view.Backend = {}, nil, nil, nil
         view.Loading, view.Done, view.Failed = false, false, false
@@ -1714,16 +2201,16 @@ local function BuildAccessoriesUI()
             Position = position,
             Size = size,
         }
-        for key, value in pairs(props or {}) do merged[key] = value end
-        local field = New(class, merged, parent)
-        Round(field, 8)
-        Stroke(field, 0.9)
-        return field
+        for field, value in pairs(props or {}) do merged[field] = value end
+        local instance = New(class, merged, parent)
+        Round(instance, 8)
+        Stroke(instance, 0.9)
+        return instance
     end
 
     -- ---------- layout ----------
     local frame = New("Frame", {
-        Name = "Accessories",
+        Name = "Catalog",
         Size = UDim2.fromScale(1, 1),
         BackgroundColor3 = THEME.Card,
         BackgroundTransparency = THEME.CardAlpha,
@@ -1738,7 +2225,7 @@ local function BuildAccessoriesUI()
         PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
     }, inner)
 
-    Label(inner, { Text = "Accessories", Font = FONT_TITLE, TextSize = 15, Size = UDim2.new(0.5, 0, 0, 20) })
+    Label(inner, { Text = "Catalog", Font = FONT_TITLE, TextSize = 15, Size = UDim2.new(0.5, 0, 0, 20) })
     side.CountLabel = Label(inner, {
         Text = "Applied: 0",
         TextSize = 12,
@@ -1748,40 +2235,9 @@ local function BuildAccessoriesUI()
         Size = UDim2.new(0.5, 0, 0, 20),
     })
 
-    -- type row: scrolls sideways (mouse wheel, drag or swipe)
-    local chipRow = New("ScrollingFrame", {
-        Name = "Types",
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        Position = UDim2.fromOffset(0, 26),
-        Size = UDim2.new(1, 0, 0, 30),
-        ScrollBarThickness = 0,
-        ScrollingDirection = Enum.ScrollingDirection.X,
-        ElasticBehavior = Enum.ElasticBehavior.Never,
-        AutomaticCanvasSize = Enum.AutomaticSize.X,
-        CanvasSize = UDim2.new(),
-    }, inner)
-    New("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 6),
-    }, chipRow)
-
-    local chips = {}
-    local function PaintChips()
-        for index, chip in ipairs(chips) do
-            local on = index == view.Type
-            chip.Button.BackgroundTransparency = on and 0 or THEME.CardAlpha
-            chip.Gradient.Enabled = on
-            chip.Button.TextColor3 = on and THEME.OnAccent or THEME.SubText
-            chip.Stroke.Transparency = on and 1 or THEME.StrokeAlpha
-        end
-    end
-
-    for index, typeInfo in ipairs(TYPES) do
+    local function MakeChip(parent, title, order)
         local button = New("TextButton", {
-            Text = typeInfo.Title,
+            Text = title,
             Font = FONT_LABEL,
             TextSize = 13,
             AutoButtonColor = false,
@@ -1789,32 +2245,104 @@ local function BuildAccessoriesUI()
             AutomaticSize = Enum.AutomaticSize.X,
             Size = UDim2.fromOffset(0, 28),
             BackgroundColor3 = Color3.new(1, 1, 1),
-            LayoutOrder = index,
-        }, chipRow)
+            LayoutOrder = order,
+        }, parent)
         Round(button, 14)
         New("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, button)
         local gradient = Gradient(button, 0)
         gradient.Enabled = false
         local stroke = Stroke(button, THEME.StrokeAlpha)
-        chips[index] = { Button = button, Gradient = gradient, Stroke = stroke }
-        button.MouseButton1Click:Connect(function() SelectType(index) end)
+        return { Button = button, Gradient = gradient, Stroke = stroke }
     end
 
-    -- the mouse wheel scrolls the row sideways while the cursor is over it
-    do
+    local function PaintChip(chip, on)
+        chip.Button.BackgroundTransparency = on and 0 or THEME.CardAlpha
+        chip.Gradient.Enabled = on
+        chip.Button.TextColor3 = on and THEME.OnAccent or THEME.SubText
+        chip.Stroke.Transparency = on and 1 or THEME.StrokeAlpha
+    end
+
+    -- sideways-scrolling row of chips (mouse wheel, drag or swipe)
+    local function MakeChipRow(y)
+        local row = New("ScrollingFrame", {
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Position = UDim2.fromOffset(0, y),
+            Size = UDim2.new(1, 0, 0, 30),
+            ScrollBarThickness = 0,
+            ScrollingDirection = Enum.ScrollingDirection.X,
+            ElasticBehavior = Enum.ElasticBehavior.Never,
+            AutomaticCanvasSize = Enum.AutomaticSize.X,
+            CanvasSize = UDim2.new(),
+        }, inner)
+        New("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            VerticalAlignment = Enum.VerticalAlignment.Center,
+            Padding = UDim.new(0, 6),
+        }, row)
+
+        -- the mouse wheel scrolls the row sideways while the cursor is over it
         local hovering = false
-        chipRow.MouseEnter:Connect(function() hovering = true end)
-        chipRow.MouseLeave:Connect(function() hovering = false end)
+        row.MouseEnter:Connect(function() hovering = true end)
+        row.MouseLeave:Connect(function() hovering = false end)
         local wheel = UserInputService.InputChanged:Connect(function(input)
             if hovering and input.UserInputType == Enum.UserInputType.MouseWheel then
-                local maxX = math.max(0, chipRow.AbsoluteCanvasSize.X - chipRow.AbsoluteWindowSize.X)
-                chipRow.CanvasPosition = Vector2.new(math.clamp(chipRow.CanvasPosition.X - input.Position.Z * 70, 0, maxX), 0)
+                local maxX = math.max(0, row.AbsoluteCanvasSize.X - row.AbsoluteWindowSize.X)
+                row.CanvasPosition = Vector2.new(math.clamp(row.CanvasPosition.X - input.Position.Z * 70, 0, maxX), 0)
             end
         end)
         RegisterCleanup(function() wheel:Disconnect() end)
+        return row
     end
 
-    -- search / asset id box, with the sort button (catalog tabs) or the Add button (an id was typed) beside it
+    -- row 1: groups
+    local groupRow = MakeChipRow(26)
+    local groupChips = {}
+    for index, group in ipairs(GROUPS) do
+        groupChips[index] = MakeChip(groupRow, group.Title, index)
+        groupChips[index].Button.MouseButton1Click:Connect(function() SelectGroup(index) end)
+    end
+
+    -- row 2: the types of the group (rebuilt per group), or the bar of an open bundle
+    local typeRow = MakeChipRow(60)
+    local typeChips = {}
+
+    local function PaintChips()
+        for index, chip in ipairs(groupChips) do PaintChip(chip, index == view.Group) end
+        for index, chip in ipairs(typeChips) do PaintChip(chip, index == view.TypeIndex) end
+    end
+
+    local function BuildTypeChips()
+        for _, chip in ipairs(typeChips) do chip.Button:Destroy() end
+        typeChips = {}
+        typeRow.CanvasPosition = Vector2.zero
+        for index, typeInfo in ipairs(GROUPS[view.Group].Types or {}) do
+            typeChips[index] = MakeChip(typeRow, typeInfo.Title, index)
+            typeChips[index].Button.MouseButton1Click:Connect(function() SelectType(index) end)
+        end
+    end
+
+    local bundleBar = New("Frame", {
+        Position = UDim2.fromOffset(0, 60),
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        Visible = false,
+    }, inner)
+    local BackButton = MakeButton(bundleBar, "Back", false, 66)
+    BackButton.Frame.Size = UDim2.fromOffset(66, 30)
+    local bundleName = Label(bundleBar, {
+        Text = "",
+        Font = FONT_LABEL,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Position = UDim2.fromOffset(76, 0),
+        Size = UDim2.new(1, -186, 1, 0),
+    })
+    BundleAction = MakeButton(bundleBar, "Wear all", true, 100)
+    BundleAction.Frame.AnchorPoint = Vector2.new(1, 0)
+    BundleAction.Frame.Position = UDim2.new(1, 0, 0, 0)
+
+    -- row 3: search / asset id box, with the sort button (catalog) or the Add button (an id was typed) beside it
     local SIDE_BUTTON = 118
     local search = Field(inner, UDim2.fromOffset(0, 62), UDim2.new(1, 0, 0, 32), "TextBox", {
         Text = "",
@@ -1830,31 +2358,14 @@ local function BuildAccessoriesUI()
 
     local SortButton = MakeButton(inner, SORTS[sortIndex].Name, false, SIDE_BUTTON)
     SortButton.Frame.AnchorPoint = Vector2.new(1, 0)
-    SortButton.Frame.Position = UDim2.new(1, 0, 0, 62)
     SortButton.Label.TextSize = 12
     local AddButton = MakeButton(inner, "Add", true, SIDE_BUTTON)
     AddButton.Frame.AnchorPoint = Vector2.new(1, 0)
-    AddButton.Frame.Position = UDim2.new(1, 0, 0, 62)
-
-    UpdateRow = function()
-        local isId = LooksLikeId(search.Text)
-        local browsing = view.Type ~= 1
-        AddButton.Frame.Visible = isId
-        SortButton.Frame.Visible = browsing and not isId
-        local right = (isId or browsing) and (SIDE_BUTTON + 8) or 0
-        search.Size = UDim2.new(1, -right, 0, 32)
-        local keyword = string.match(side.Query, "^%s*(.-)%s*$")
-        local shown = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
-        if keyword == "" and shown.Type == 0 then shown = SORTS[DEFAULT_SORT] end
-        SortButton.Label.Text = shown.Name
-    end
 
     -- grid, open from the start
     side.Scroll = New("ScrollingFrame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Position = UDim2.fromOffset(0, 102),
-        Size = UDim2.new(1, 0, 1, -102),
         ScrollBarThickness = 3,
         ScrollBarImageColor3 = THEME.Muted,
         ScrollingDirection = Enum.ScrollingDirection.Y,
@@ -1868,38 +2379,164 @@ local function BuildAccessoriesUI()
     }, side.Scroll)
     ResponsiveGrid(side.Scroll, GAP, CELL_HEIGHT, 110)
 
+    -- Positions follow what is visible: the type row only exists for groups with types, an open bundle swaps it
+    -- for the bundle bar and hides the search box.
+    Layout = function()
+        local group = GROUPS[view.Group]
+        local inBundle = view.Bundle ~= nil
+        local hasTypes = group.Types ~= nil and not inBundle
+        typeRow.Visible = hasTypes
+        bundleBar.Visible = inBundle
+
+        local searchY = (hasTypes or inBundle) and 96 or 62
+        search.Visible = not inBundle
+        search.Position = UDim2.fromOffset(0, searchY)
+        SortButton.Frame.Position = UDim2.new(1, 0, 0, searchY)
+        AddButton.Frame.Position = UDim2.new(1, 0, 0, searchY)
+
+        local gridY = inBundle and (searchY - 0) or (searchY + 40)
+        side.Scroll.Position = UDim2.fromOffset(0, gridY)
+        side.Scroll.Size = UDim2.new(1, 0, 1, -gridY)
+    end
+
+    UpdateRow = function()
+        local isId = LooksLikeId(search.Text)
+        local browsing = Browsing()
+        AddButton.Frame.Visible = isId and view.Bundle == nil
+        SortButton.Frame.Visible = browsing and not isId
+        local right = ((isId or browsing) and view.Bundle == nil) and (SIDE_BUTTON + 8) or 0
+        search.Size = UDim2.new(1, -right, 0, 32)
+        local keyword = string.match(side.Query, "^%s*(.-)%s*$")
+        local shown = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
+        if keyword == "" and shown.Type == 0 then shown = SORTS[DEFAULT_SORT] end
+        SortButton.Label.Text = shown.Name
+    end
+
     -- ---------- behaviour ----------
-    SelectType = function(index)
-        if index ~= 1 and engineBroken and not RequestFunction() then
+    local function CatalogUnavailable()
+        return engineBroken and not RequestFunction()
+    end
+
+    SelectGroup = function(index)
+        if GROUPS[index].Types and CatalogUnavailable() then
             SetStatus("Catalog browsing is unavailable here: the game catalog failed and this executor has no request function.", THEME.Danger, 8)
             return
         end
-        view.Type = index
+        view.Group = index
+        view.TypeIndex = 1
+        view.Bundle, view.BundleEntries = nil, nil
+        BuildTypeChips()
         PaintChips()
+        Layout()
         UpdateRow()
-        if index == 1 then
+        if GROUPS[index].Types then
+            ResetBrowse()
+        else
             view.Token = view.Token + 1
             side.Scroll.CanvasPosition = Vector2.zero
             Render()
-        else
-            ResetBrowse()
         end
     end
 
+    SelectType = function(index)
+        view.TypeIndex = index
+        PaintChips()
+        ResetBrowse()
+    end
+
+    -- Opens a bundle: its parts (head, torso, arms, legs, shoes...) become the grid, each worn on its own.
+    OpenBundle = function(entry)
+        view.Bundle, view.BundleEntries = entry, nil
+        bundleName.Text = entry.Name
+        side.Scroll.CanvasPosition = Vector2.zero
+        Layout()
+        UpdateRow()
+        Render()
+        SetStatus("Loading " .. entry.Name .. "...", THEME.SubText, 30)
+
+        task.spawn(function()
+            local cached = bundleParts[entry.Id]
+            local parts = {}
+            if cached then
+                parts = cached
+            else
+                for _, part in ipairs(FetchBundleParts(entry.Id)) do
+                    local assetType = Catalog.AssetTypeOf(part.Id)
+                    if assetType and Catalog.IsSupportedType(assetType) then
+                        table.insert(parts, GetEntry(part.Id, part.Name, { AssetType = assetType }))
+                    end
+                end
+                bundleParts[entry.Id] = parts
+            end
+            if view.Bundle ~= entry then return end
+            view.BundleEntries = parts
+            Render()
+            if #parts == 0 then
+                SetStatus("Nothing in this bundle can be worn here.", THEME.SubText)
+            else
+                statusUntil = 0
+                ShowHint()
+            end
+        end)
+    end
+
+    local function CloseBundle()
+        view.Bundle, view.BundleEntries = nil, nil
+        Layout()
+        UpdateRow()
+        side.Scroll.CanvasPosition = Vector2.zero
+        Render()
+    end
+
+    BackButton.Hit.MouseButton1Click:Connect(CloseBundle)
+
+    BundleAction.Hit.MouseButton1Click:Connect(function()
+        local entry = view.Bundle
+        local parts = entry and view.BundleEntries
+        if not parts or #parts == 0 then return end
+        if BundleWorn(entry) then
+            for _, part in ipairs(parts) do Catalog.Remove(part.Id) end
+            PaintAll()
+            SetStatus(entry.Name .. " taken off.", THEME.Success)
+            return
+        end
+        SetStatus("Applying " .. entry.Name .. "...", THEME.SubText, 30)
+        task.spawn(function()
+            local failed
+            for _, part in ipairs(parts) do
+                if not Catalog.IsApplied(part.Id) then
+                    local ok, message = Catalog.Apply(part.Id, part.AssetType)
+                    if not ok then failed = failed or message end
+                end
+            end
+            PaintAll()
+            if failed then
+                SetStatus("Some parts did not fit: " .. failed, THEME.Danger, 6)
+            else
+                SetStatus(entry.Name .. " equipped.", THEME.Success)
+            end
+        end)
+    end)
+
     local function AddFromInput()
-        local assetId = ParseId(search.Text)
-        if not assetId then
+        local text = search.Text
+        local id = ParseId(text)
+        if not id then
             SetStatus("Type a numeric asset ID or paste a catalog link.", THEME.Danger)
             return
         end
         search.Text = ""
 
-        local entry = entryById[assetId]
+        local isBundle = string.find(text, "/bundles/", 1, true) ~= nil
+        local key = (isBundle and "b" or "a") .. string.format("%.0f", id)
+        local entry = entryByKey[key]
         if not entry then
-            entry = GetEntry(assetId, "Accessory " .. string.format("%.0f", assetId), {})
+            entry = GetEntry(id, (isBundle and "Bundle " or "Item ") .. string.format("%.0f", id), { IsBundle = isBundle or nil })
             -- the real name comes from the catalog, filled in when it arrives
             task.spawn(function()
-                local ok, info = pcall(function() return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset) end)
+                local ok, info = pcall(function()
+                    return MarketplaceService:GetProductInfo(id, isBundle and Enum.InfoType.Bundle or Enum.InfoType.Asset)
+                end)
                 if ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "" then
                     entry.Name = info.Name
                     Render()
@@ -1907,8 +2544,12 @@ local function BuildAccessoriesUI()
             end)
         end
         Feature(entry)
-        if view.Type ~= 1 then SelectType(1) else Render() end
-        if not Accessories.IsApplied(assetId) then Toggle(entry) end
+        if GROUPS[view.Group].Types or view.Bundle then SelectGroup(1) else Render() end
+        if isBundle then
+            OpenBundle(entry)
+        elseif not Catalog.IsApplied(id) then
+            Toggle(entry)
+        end
     end
 
     AddButton.Hit.MouseButton1Click:Connect(AddFromInput)
@@ -1930,7 +2571,7 @@ local function BuildAccessoriesUI()
     search:GetPropertyChangedSignal("Text"):Connect(function()
         side.Query = search.Text
         UpdateRow()
-        if view.Type == 1 then
+        if not Browsing() then
             side.Scroll.CanvasPosition = Vector2.zero
             Render()
         elseif not LooksLikeId(search.Text) then
@@ -1944,20 +2585,19 @@ local function BuildAccessoriesUI()
 
     -- more results load as the grid nears its end
     side.Scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
-        if view.Type ~= 1 and NeedsMore() then task.spawn(LoadMore) end
+        if Browsing() and NeedsMore() then task.spawn(LoadMore) end
     end)
 
-    Accessories.OnChange = function() PaintAll() end
+    Catalog.OnChange = function() PaintAll() end
 
     RemoveAllButton.Hit.MouseButton1Click:Connect(function()
-        local count = Accessories.Clear()
+        local count = Catalog.Clear()
         PaintAll()
-        SetStatus(count > 0 and ("Removed " .. count .. " accessor" .. (count == 1 and "y" or "ies") .. ".") or "Nothing to remove.", count > 0 and THEME.Success or THEME.SubText)
+        SetStatus(count > 0 and ("Took off " .. count .. " item" .. (count == 1 and "" or "s") .. ".") or "Nothing to take off.", count > 0 and THEME.Success or THEME.SubText)
     end)
 
-    PaintChips()
-    UpdateRow()
-    SelectType(2) -- "All", most popular first (falls back to Featured when no catalog source works)
+    Layout()
+    SelectGroup(DEFAULT_GROUP) -- Accessories / All, most popular first (falls back to Featured when no source works)
 end
 
-BuildAccessoriesUI()
+BuildCatalogUI()
