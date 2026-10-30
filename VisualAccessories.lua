@@ -1,6 +1,7 @@
 -- Visual Accessories (standalone) - by Honami
 -- UI is built in this file (styled after Mugiwara UI); the accessory logic is ported from Mugiwara HUB's
--- Manager/VisualAccessories.lua (and the rig lookup of Rigs.lua). Runs in its own window.
+-- Manager/VisualAccessories.lua (and the rig lookup of Rigs.lua). Runs in its own window, in any game:
+-- Evade uses its custom rigs, every other game the normal Roblox character.
 
 local SCRIPT_NAME = "Visual Accessories"
 
@@ -10,15 +11,6 @@ local SCRIPT_NAME = "Visual Accessories"
 -- the same window (sidebar with one tab per script, like the hub); alone, a script gets the plain window.
 -- ==========================================================
 
--- Only runs in Evade (same place ids as Mugiwara HUB); in any other game nothing is loaded.
-local EVADE_PLACE_IDS = { [9872472334] = true, [99214917572799] = true, [10668472534] = true }
-if not EVADE_PLACE_IDS[game.PlaceId] then
-    warn("[" .. SCRIPT_NAME .. "] This script only works in Evade.")
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", { Title = SCRIPT_NAME, Text = "This script only works in Evade.", Duration = 6 })
-    end)
-    return
-end
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -920,23 +912,27 @@ if env.VisualAccessoriesCleanup then pcall(env.VisualAccessoriesCleanup) end
 env.VisualAccessoriesCleanup = ModuleCleanup
 
 -- ==========================================================
--- Rigs (from Games/Evade/Rigs.lua, only what Visual Accessories needs)
+-- Rigs: which models get the accessories
+--   Evade     : the custom rigs in Workspace.Rigs named after the player (menu/inventory and in-game; both are
+--               visual copies, from Games/Evade/Rigs.lua)
+--   any other : the normal Roblox character (R6 or R15)
 -- ==========================================================
--- Evade can have TWO rigs named after the player in Workspace.Rigs (menu/inventory and in-game); both
--- are visual copies and both get the accessories.
 local Rigs = {}
 do
     local LocalPlayer = Players.LocalPlayer
+    local EVADE_PLACE_IDS = { [9872472334] = true, [99214917572799] = true, [10668472534] = true }
 
     function Rigs.GetAll()
         local list = {}
 
-        local container = workspace:FindFirstChild("Rigs")
-        if container then
-            for _, child in ipairs(container:GetChildren()) do
-                if child:IsA("Model") and child.Name == LocalPlayer.Name then
-                    local humanoid = child:FindFirstChildOfClass("Humanoid")
-                    if humanoid then table.insert(list, { Rig = child, Humanoid = humanoid }) end
+        if EVADE_PLACE_IDS[game.PlaceId] then
+            local container = workspace:FindFirstChild("Rigs")
+            if container then
+                for _, child in ipairs(container:GetChildren()) do
+                    if child:IsA("Model") and child.Name == LocalPlayer.Name then
+                        local humanoid = child:FindFirstChildOfClass("Humanoid")
+                        if humanoid then table.insert(list, { Rig = child, Humanoid = humanoid }) end
+                    end
                 end
             end
         end
@@ -1042,7 +1038,7 @@ do
     -- May yield (the asset is downloaded the first time). Returns true, message or false, reason.
     function Accessories.Apply(assetId)
         local rigs = GetAllRigs()
-        if #rigs == 0 then return false, "No character found. Spawn into a round first." end
+        if #rigs == 0 then return false, "No character found yet. Wait until you have spawned." end
 
         local cachedAcc = cache[assetId]
         if not cachedAcc then
