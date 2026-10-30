@@ -1143,8 +1143,8 @@ Page = Shell:AddPage({
     TabTitle = "Accessories",
     Letter = "A",
     Order = 4,
-    Width = 400,
-    Height = 470,
+    Width = 430,
+    Height = 560,
     Cleanup = ModuleCleanup,
 })
 local PageLayout = BuildPageLayout(Page.Frame)
@@ -1155,12 +1155,42 @@ RemoveAllButton.Frame.AnchorPoint = Vector2.new(1, 0.5)
 RemoveAllButton.Frame.Position = UDim2.new(1, -12, 0.5, 0)
 
 -- ==========================================================
--- Accessories grid (same UI as Visual Unusual; every cell shows the accessory's picture, loaded from its
--- asset id, and accessories can be added by asset id or catalog link)
+-- Accessories browser (same look as Visual Unusual). Every cell shows the accessory's picture (loaded from
+-- its asset id). The list comes from the Roblox catalog (accessories only): pick a type in the row at the top,
+-- search by keyword, change the order, and more load as you scroll. "Featured" holds the hub's templates and
+-- anything added by asset id. Catalog access needs the executor's request function; without it the script
+-- falls back to Featured.
 -- ==========================================================
 local MarketplaceService = game:GetService("MarketplaceService")
 
 local CELL_HEIGHT, TITLE_HEIGHT, GAP = 112, 20, 6
+local PAGE_SIZE = 30
+local CACHE_SECONDS = 300
+local SEARCH_DELAY = 0.6
+
+-- Catalog types: Category 11 is Accessories, Subcategory narrows it to one slot. Hair lives under Body (18).
+local TYPES = {
+    { Key = "Featured", Title = "Featured" },
+    { Key = "All", Title = "All", Category = 11 },
+    { Key = "Head", Title = "Head", Category = 11, Sub = 54 },
+    { Key = "Hair", Title = "Hair", Category = 18, Sub = 20 },
+    { Key = "Face", Title = "Face", Category = 11, Sub = 21 },
+    { Key = "Neck", Title = "Neck", Category = 11, Sub = 22 },
+    { Key = "Shoulder", Title = "Shoulder", Category = 11, Sub = 23 },
+    { Key = "Front", Title = "Front", Category = 11, Sub = 24 },
+    { Key = "Back", Title = "Back", Category = 11, Sub = 25 },
+    { Key = "Waist", Title = "Waist", Category = 11, Sub = 26 },
+}
+
+local SORTS = {
+    { Name = "Relevance", Type = 0 },
+    { Name = "Popular", Type = 2, Aggregation = 3 },
+    { Name = "Newest", Type = 3 },
+    { Name = "Most Favorited", Type = 1 },
+    { Name = "Price: Low to High", Type = 4 },
+    { Name = "Price: High to Low", Type = 5 },
+}
+local DEFAULT_SORT, SEARCH_SORT = 2, 1
 
 local function ThumbnailOf(assetId)
     return "rbxthumb://type=Asset&id=" .. string.format("%.0f", assetId) .. "&w=150&h=150"
@@ -1171,37 +1201,110 @@ local function ParseId(text)
     return digits and tonumber(digits) or nil
 end
 
-local function BuildAccessoriesUI()
-    local entries, byId = {}, {}
-    local side = { Query = "", TileList = {}, TileByEntry = {} }
-    local statusUntil = 0
-    local PaintAll, Render
+-- "12345678", "https://www.roblox.com/catalog/12345678/Name" or "rbxassetid://12345678"
+local function LooksLikeId(text)
+    text = text or ""
+    if string.match(text, "^%s*%d%d%d%d%d+%s*$") then return true end
+    return (string.find(text, "roblox.com", 1, true) or string.find(text, "rbxassetid", 1, true)) ~= nil and ParseId(text) ~= nil
+end
 
-    local function AddEntry(assetId, name, custom)
-        if byId[assetId] then return byId[assetId] end
-        local entry = { Id = assetId, Name = name, Custom = custom }
-        table.insert(entries, entry)
-        byId[assetId] = entry
+local function PriceText(entry)
+    if entry.Status == "Off Sale" then return "Off sale" end
+    if type(entry.Price) ~= "number" then return "" end
+    if entry.Price == 0 then return "Free" end
+    return "R$ " .. entry.Price
+end
+
+local function RequestFunction()
+    local env = getgenv()
+    return env.request or env.http_request or (env.syn and env.syn.request) or (env.http and env.http.request) or (env.fluxus and env.fluxus.request)
+end
+
+-- ---------- catalog access ----------
+local responseCache = {}
+
+-- May yield. Returns the decoded JSON table, or nil and a reason ("no-request", "rate", "failed").
+local function CatalogGet(url)
+    local hit = responseCache[url]
+    if hit and os.clock() - hit.At < CACHE_SECONDS then return hit.Data end
+
+    local send = RequestFunction()
+    if not send then return nil, "no-request" end
+
+    for attempt = 1, 2 do
+        local ok, response = pcall(send, { Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
+        if not ok or type(response) ~= "table" then return nil, "failed" end
+
+        local code = response.StatusCode
+        if code == 429 then
+            if attempt == 2 then return nil, "rate" end
+            task.wait(3)
+        else
+            if code ~= 200 then return nil, "failed" end
+            local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+            if not decoded or type(data) ~= "table" then return nil, "failed" end
+            responseCache[url] = { At = os.clock(), Data = data }
+            return data
+        end
+    end
+    return nil, "rate"
+end
+
+local function CatalogUrl(typeInfo, keyword, sort, cursor)
+    local parts = { "Limit=" .. PAGE_SIZE, "Category=" .. typeInfo.Category }
+    if typeInfo.Sub then table.insert(parts, "Subcategory=" .. typeInfo.Sub) end
+    if keyword ~= "" then table.insert(parts, "Keyword=" .. HttpService:UrlEncode(keyword)) end
+    table.insert(parts, "SortType=" .. sort.Type)
+    if sort.Aggregation then table.insert(parts, "SortAggregation=" .. sort.Aggregation) end
+    if cursor then table.insert(parts, "Cursor=" .. HttpService:UrlEncode(cursor)) end
+    return "https://catalog.roblox.com/v1/search/items/details?" .. table.concat(parts, "&")
+end
+
+local function BuildAccessoriesUI()
+    local entryById = {}
+    local featured = {}
+    local side = { Query = "", TileList = {}, TileByEntry = {} }
+    local view = { Type = 1, Entries = {}, Cursor = nil, Loading = false, Done = false, Failed = false, Token = 0 }
+    local sortIndex, sortChosen = DEFAULT_SORT, false
+    local statusUntil = 0
+    local PaintAll, Render, LoadMore, SelectType, UpdateRow
+
+    -- one entry per asset id, shared by Featured and every catalog result
+    local function GetEntry(assetId, name, extra)
+        local entry = entryById[assetId]
+        if not entry then
+            entry = { Id = assetId, Name = name }
+            entryById[assetId] = entry
+        end
+        if name and name ~= "" and not entry.Pinned then entry.Name = name end
+        for key, value in pairs(extra or {}) do entry[key] = value end
         return entry
     end
 
-    for _, template in ipairs(Accessories.Templates) do AddEntry(template.ID, template.Name, false) end
+    local function Feature(entry)
+        if not table.find(featured, entry) then table.insert(featured, entry) end
+    end
+
+    for _, template in ipairs(Accessories.Templates) do
+        local entry = GetEntry(template.ID, template.Name, { Pinned = true })
+        Feature(entry)
+    end
 
     local function ShowHint()
         local count = Accessories.AppliedCount()
         if count == 0 then
-            StatusLabel.Text = "Pick an accessory, or add one by its asset ID."
+            StatusLabel.Text = "Pick an accessory, or paste an asset ID."
         else
             StatusLabel.Text = "Wearing " .. count .. " accessor" .. (count == 1 and "y" or "ies") .. ". Pick one again to take it off."
         end
         StatusLabel.TextColor3 = THEME.SubText
     end
 
-    local function SetStatus(text, color)
-        statusUntil = os.clock() + 3.5
+    local function SetStatus(text, color, duration)
+        statusUntil = os.clock() + (duration or 3.5)
         StatusLabel.Text = text
         StatusLabel.TextColor3 = color or THEME.SubText
-        task.delay(3.6, function()
+        task.delay((duration or 3.5) + 0.1, function()
             if os.clock() >= statusUntil then ShowHint() end
         end)
     end
@@ -1280,6 +1383,23 @@ local function BuildAccessoriesUI()
             Image = ThumbnailOf(entry.Id),
             ScaleType = Enum.ScaleType.Fit,
         }, thumb)
+
+        local price = Label(thumb, {
+            Text = "",
+            Font = FONT_LABEL,
+            TextSize = 10,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            BackgroundTransparency = 0.45,
+            BackgroundColor3 = Color3.new(0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.X,
+            Position = UDim2.fromOffset(4, 4),
+            Size = UDim2.fromOffset(0, 15),
+            ZIndex = 2,
+            Visible = false,
+        })
+        Round(price, 5)
+        New("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, price)
+
         local name = Label(button, {
             Text = entry.Name,
             Font = FONT_LABEL,
@@ -1303,30 +1423,109 @@ local function BuildAccessoriesUI()
         Round(badge, 9)
         CheckGlyph(badge, 12, THEME.OnAccent)
 
-        local tile = { Entry = entry, Button = button, Stroke = stroke, Badge = badge, Name = name }
+        local tile = { Entry = entry, Button = button, Stroke = stroke, Badge = badge, Name = name, Price = price }
         button.MouseEnter:Connect(function() PaintTile(tile, true) end)
         button.MouseLeave:Connect(function() PaintTile(tile, false) end)
         button.MouseButton1Click:Connect(function() Toggle(entry) end)
         return tile
     end
 
-    Render = function()
-        local query = string.lower(side.Query)
-        local list, map = {}, {}
-        for _, entry in ipairs(entries) do
-            if query == "" or string.find(string.lower(entry.Name), query, 1, true) or string.find(tostring(entry.Id), query, 1, true) then
-                local tile = side.TileByEntry[entry] or MakeTile(entry)
-                tile.Button.LayoutOrder = #list + 1
-                tile.Name.Text = entry.Name
-                table.insert(list, tile)
-                map[entry] = tile
+    -- The list shown now: Featured (filtered by the typed text) or the catalog results of this type.
+    local function CurrentList()
+        if view.Type == 1 then
+            local query = string.lower(side.Query)
+            if query == "" then return featured end
+            local list = {}
+            for _, entry in ipairs(featured) do
+                if string.find(string.lower(entry.Name), query, 1, true) or string.find(tostring(entry.Id), query, 1, true) then
+                    table.insert(list, entry)
+                end
             end
+            return list
+        end
+        return view.Entries
+    end
+
+    Render = function()
+        local list, map = {}, {}
+        for _, entry in ipairs(CurrentList()) do
+            local tile = side.TileByEntry[entry] or MakeTile(entry)
+            tile.Button.LayoutOrder = #list + 1
+            tile.Name.Text = entry.Name
+            local priceText = PriceText(entry)
+            tile.Price.Text = priceText
+            tile.Price.Visible = priceText ~= ""
+            table.insert(list, tile)
+            map[entry] = tile
         end
         for entry, tile in pairs(side.TileByEntry) do
             if not map[entry] then tile.Button:Destroy() end
         end
         side.TileList, side.TileByEntry = list, map
         PaintAll()
+    end
+
+    -- ---------- catalog loading ----------
+    local function NeedsMore()
+        local scroll = side.Scroll
+        local remaining = scroll.AbsoluteCanvasSize.Y - (scroll.CanvasPosition.Y + scroll.AbsoluteWindowSize.Y)
+        return remaining < 160
+    end
+
+    LoadMore = function()
+        if view.Type == 1 or view.Loading or view.Done or view.Failed then return end
+        view.Loading = true
+        local mine = view.Token
+        local typeInfo = TYPES[view.Type]
+        local keyword = string.match(side.Query, "^%s*(.-)%s*$")
+        local sort = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
+        if keyword == "" and sort.Type == 0 then sort = SORTS[DEFAULT_SORT] end
+
+        SetStatus("Loading accessories...", THEME.SubText, 30)
+        local data, reason = CatalogGet(CatalogUrl(typeInfo, keyword, sort, view.Cursor))
+        if mine ~= view.Token then return end
+        view.Loading = false
+
+        if not data then
+            view.Failed = true
+            if reason == "no-request" then
+                SetStatus("Catalog browsing needs an executor with request support.", THEME.Danger, 6)
+                if view.Type ~= 1 then SelectType(1) end
+            elseif reason == "rate" then
+                SetStatus("Roblox is limiting catalog requests. Try again in a moment.", THEME.Danger, 6)
+            else
+                SetStatus("Could not reach the Roblox catalog.", THEME.Danger, 6)
+            end
+            return
+        end
+
+        for _, item in ipairs(type(data.data) == "table" and data.data or {}) do
+            if type(item.id) == "number" and type(item.name) == "string" then
+                local entry = GetEntry(item.id, item.name, { Price = item.price, Status = item.priceStatus, Creator = item.creatorName })
+                if not table.find(view.Entries, entry) then table.insert(view.Entries, entry) end
+            end
+        end
+        view.Cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or nil
+        view.Done = view.Cursor == nil
+
+        Render()
+        if #view.Entries == 0 then
+            SetStatus("No accessories found.", THEME.SubText)
+        else
+            statusUntil = 0
+            ShowHint()
+        end
+        -- the first pages may not fill the window yet
+        if not view.Done and NeedsMore() then task.defer(LoadMore) end
+    end
+
+    local function ResetBrowse()
+        view.Token = view.Token + 1
+        view.Entries, view.Cursor = {}, nil
+        view.Loading, view.Done, view.Failed = false, false, false
+        side.Scroll.CanvasPosition = Vector2.zero
+        Render()
+        task.spawn(LoadMore)
     end
 
     -- dark inset field (Base.Field in Mugiwara UI)
@@ -1345,6 +1544,7 @@ local function BuildAccessoriesUI()
         return field
     end
 
+    -- ---------- layout ----------
     local frame = New("Frame", {
         Name = "Accessories",
         Size = UDim2.fromScale(1, 1),
@@ -1371,56 +1571,77 @@ local function BuildAccessoriesUI()
         Size = UDim2.new(0.5, 0, 0, 20),
     })
 
-    -- add by asset id or catalog link
-    local idBox = Field(inner, UDim2.fromOffset(0, 26), UDim2.new(1, -76, 0, 32), "TextBox", {
-        Text = "",
-        PlaceholderText = "Asset ID or catalog link...",
-        PlaceholderColor3 = THEME.Muted,
-        TextColor3 = THEME.Text,
-        Font = FONT_BODY,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ClearTextOnFocus = false,
-    })
-    New("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, idBox)
+    -- type row: scrolls sideways (mouse wheel, drag or swipe)
+    local chipRow = New("ScrollingFrame", {
+        Name = "Types",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(0, 26),
+        Size = UDim2.new(1, 0, 0, 30),
+        ScrollBarThickness = 0,
+        ScrollingDirection = Enum.ScrollingDirection.X,
+        ElasticBehavior = Enum.ElasticBehavior.Never,
+        AutomaticCanvasSize = Enum.AutomaticSize.X,
+        CanvasSize = UDim2.new(),
+    }, inner)
+    New("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 6),
+    }, chipRow)
 
-    local AddButton = MakeButton(inner, "Add", true, 68)
-    AddButton.Frame.AnchorPoint = Vector2.new(1, 0)
-    AddButton.Frame.Position = UDim2.new(1, 0, 0, 26)
-
-    local function AddFromInput()
-        local assetId = ParseId(idBox.Text)
-        if not assetId then
-            SetStatus("Type a numeric asset ID or paste a catalog link.", THEME.Danger)
-            return
+    local chips = {}
+    local function PaintChips()
+        for index, chip in ipairs(chips) do
+            local on = index == view.Type
+            chip.Button.BackgroundTransparency = on and 0 or THEME.CardAlpha
+            chip.Gradient.Enabled = on
+            chip.Button.TextColor3 = on and THEME.OnAccent or THEME.SubText
+            chip.Stroke.Transparency = on and 1 or THEME.StrokeAlpha
         end
-        idBox.Text = ""
-
-        local entry = byId[assetId]
-        if not entry then
-            entry = AddEntry(assetId, "Accessory " .. string.format("%.0f", assetId), true)
-            Render()
-            -- the real name comes from the catalog, filled in when it arrives
-            task.spawn(function()
-                local ok, info = pcall(function() return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset) end)
-                if ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "" then
-                    entry.Name = info.Name
-                    Render()
-                end
-            end)
-        end
-        if not Accessories.IsApplied(assetId) then Toggle(entry) end
     end
 
-    AddButton.Hit.MouseButton1Click:Connect(AddFromInput)
-    idBox.FocusLost:Connect(function(enterPressed)
-        if enterPressed then AddFromInput() end
-    end)
+    for index, typeInfo in ipairs(TYPES) do
+        local button = New("TextButton", {
+            Text = typeInfo.Title,
+            Font = FONT_LABEL,
+            TextSize = 13,
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            AutomaticSize = Enum.AutomaticSize.X,
+            Size = UDim2.fromOffset(0, 28),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            LayoutOrder = index,
+        }, chipRow)
+        Round(button, 14)
+        New("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, button)
+        local gradient = Gradient(button, 0)
+        gradient.Enabled = false
+        local stroke = Stroke(button, THEME.StrokeAlpha)
+        chips[index] = { Button = button, Gradient = gradient, Stroke = stroke }
+        button.MouseButton1Click:Connect(function() SelectType(index) end)
+    end
 
-    -- search
-    local search = Field(inner, UDim2.fromOffset(0, 64), UDim2.new(1, 0, 0, 32), "TextBox", {
+    -- the mouse wheel scrolls the row sideways while the cursor is over it
+    do
+        local hovering = false
+        chipRow.MouseEnter:Connect(function() hovering = true end)
+        chipRow.MouseLeave:Connect(function() hovering = false end)
+        local wheel = UserInputService.InputChanged:Connect(function(input)
+            if hovering and input.UserInputType == Enum.UserInputType.MouseWheel then
+                local maxX = math.max(0, chipRow.AbsoluteCanvasSize.X - chipRow.AbsoluteWindowSize.X)
+                chipRow.CanvasPosition = Vector2.new(math.clamp(chipRow.CanvasPosition.X - input.Position.Z * 70, 0, maxX), 0)
+            end
+        end)
+        RegisterCleanup(function() wheel:Disconnect() end)
+    end
+
+    -- search / asset id box, with the sort button (catalog tabs) or the Add button (an id was typed) beside it
+    local SIDE_BUTTON = 118
+    local search = Field(inner, UDim2.fromOffset(0, 62), UDim2.new(1, 0, 0, 32), "TextBox", {
         Text = "",
-        PlaceholderText = "Search accessory...",
+        PlaceholderText = "Search, or paste an asset ID / link...",
         PlaceholderColor3 = THEME.Muted,
         TextColor3 = THEME.Text,
         Font = FONT_BODY,
@@ -1430,12 +1651,33 @@ local function BuildAccessoriesUI()
     })
     New("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, search)
 
-    -- grid
+    local SortButton = MakeButton(inner, SORTS[sortIndex].Name, false, SIDE_BUTTON)
+    SortButton.Frame.AnchorPoint = Vector2.new(1, 0)
+    SortButton.Frame.Position = UDim2.new(1, 0, 0, 62)
+    SortButton.Label.TextSize = 12
+    local AddButton = MakeButton(inner, "Add", true, SIDE_BUTTON)
+    AddButton.Frame.AnchorPoint = Vector2.new(1, 0)
+    AddButton.Frame.Position = UDim2.new(1, 0, 0, 62)
+
+    UpdateRow = function()
+        local isId = LooksLikeId(search.Text)
+        local browsing = view.Type ~= 1
+        AddButton.Frame.Visible = isId
+        SortButton.Frame.Visible = browsing and not isId
+        local right = (isId or browsing) and (SIDE_BUTTON + 8) or 0
+        search.Size = UDim2.new(1, -right, 0, 32)
+        local keyword = string.match(side.Query, "^%s*(.-)%s*$")
+        local shown = SORTS[(keyword ~= "" and not sortChosen) and SEARCH_SORT or sortIndex]
+        if keyword == "" and shown.Type == 0 then shown = SORTS[DEFAULT_SORT] end
+        SortButton.Label.Text = shown.Name
+    end
+
+    -- grid, open from the start
     side.Scroll = New("ScrollingFrame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Position = UDim2.fromOffset(0, 104),
-        Size = UDim2.new(1, 0, 1, -104),
+        Position = UDim2.fromOffset(0, 102),
+        Size = UDim2.new(1, 0, 1, -102),
         ScrollBarThickness = 3,
         ScrollBarImageColor3 = THEME.Muted,
         ScrollingDirection = Enum.ScrollingDirection.Y,
@@ -1453,10 +1695,83 @@ local function BuildAccessoriesUI()
         CellPadding = UDim2.fromOffset(GAP, GAP),
     }, side.Scroll)
 
+    -- ---------- behaviour ----------
+    SelectType = function(index)
+        if index ~= 1 and not RequestFunction() then
+            SetStatus("Catalog browsing needs an executor with request support.", THEME.Danger, 6)
+            return
+        end
+        view.Type = index
+        PaintChips()
+        UpdateRow()
+        if index == 1 then
+            view.Token = view.Token + 1
+            side.Scroll.CanvasPosition = Vector2.zero
+            Render()
+        else
+            ResetBrowse()
+        end
+    end
+
+    local function AddFromInput()
+        local assetId = ParseId(search.Text)
+        if not assetId then
+            SetStatus("Type a numeric asset ID or paste a catalog link.", THEME.Danger)
+            return
+        end
+        search.Text = ""
+
+        local entry = entryById[assetId]
+        if not entry then
+            entry = GetEntry(assetId, "Accessory " .. string.format("%.0f", assetId), {})
+            -- the real name comes from the catalog, filled in when it arrives
+            task.spawn(function()
+                local ok, info = pcall(function() return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset) end)
+                if ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "" then
+                    entry.Name = info.Name
+                    Render()
+                end
+            end)
+        end
+        Feature(entry)
+        if view.Type ~= 1 then SelectType(1) else Render() end
+        if not Accessories.IsApplied(assetId) then Toggle(entry) end
+    end
+
+    AddButton.Hit.MouseButton1Click:Connect(AddFromInput)
+    SortButton.Hit.MouseButton1Click:Connect(function()
+        local keyword = string.match(side.Query, "^%s*(.-)%s*$")
+        sortChosen = true
+        -- Relevance only makes sense with a keyword; without one the list goes Popular -> Newest -> ...
+        repeat
+            sortIndex = sortIndex % #SORTS + 1
+        until keyword ~= "" or SORTS[sortIndex].Type ~= 0
+        UpdateRow()
+        ResetBrowse()
+    end)
+
+    local searchToken = 0
+    search.FocusLost:Connect(function(enterPressed)
+        if enterPressed and LooksLikeId(search.Text) then AddFromInput() end
+    end)
     search:GetPropertyChangedSignal("Text"):Connect(function()
         side.Query = search.Text
-        side.Scroll.CanvasPosition = Vector2.zero
-        Render()
+        UpdateRow()
+        if view.Type == 1 then
+            side.Scroll.CanvasPosition = Vector2.zero
+            Render()
+        elseif not LooksLikeId(search.Text) then
+            searchToken = searchToken + 1
+            local mine = searchToken
+            task.delay(SEARCH_DELAY, function()
+                if mine == searchToken then ResetBrowse() end
+            end)
+        end
+    end)
+
+    -- more results load as the grid nears its end
+    side.Scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+        if view.Type ~= 1 and NeedsMore() then task.spawn(LoadMore) end
     end)
 
     Accessories.OnChange = function() PaintAll() end
@@ -1467,7 +1782,14 @@ local function BuildAccessoriesUI()
         SetStatus(count > 0 and ("Removed " .. count .. " accessor" .. (count == 1 and "y" or "ies") .. ".") or "Nothing to remove.", count > 0 and THEME.Success or THEME.SubText)
     end)
 
-    Render()
+    PaintChips()
+    UpdateRow()
+    if RequestFunction() then
+        SelectType(2) -- "All", most popular first
+    else
+        Render()
+        SetStatus("Catalog browsing needs an executor with request support. Featured and asset IDs still work.", THEME.SubText, 8)
+    end
 end
 
 BuildAccessoriesUI()
