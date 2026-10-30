@@ -984,11 +984,10 @@ end
 --   Accessory   hats, hair, face / neck / shoulder / front / back / waist items, 3D (layered) clothing, shoes
 --   Clothing    classic shirt, pants, t-shirt
 --   Face        classic faces
---   Head        classic heads; DynamicHead: the head mesh of a dynamic head
---   Limb        body parts (torso, arms, legs) of body bundles
+--   Body        heads (classic and dynamic) and torso / arms / legs of body bundles: the whole body of the rig is
+--               rebuilt to match an avatar made with those parts (sizes, meshes and joints), see "body" below
 -- The kind of an item comes from its asset type (asked from Roblox the first time), so any asset id works.
--- Accessory handling is ported from Manager/VisualAccessories.lua; body parts reuse the in-place mesh swap
--- the Korblox legs use there.
+-- Accessory handling is ported from Manager/VisualAccessories.lua.
 -- ==========================================================
 local Catalog = {}
 do
@@ -1010,13 +1009,14 @@ do
         [11] = { Kind = "Clothing", Slot = "Shirt", Class = "Shirt" },
         [12] = { Kind = "Clothing", Slot = "Pants", Class = "Pants" },
         [18] = { Kind = "Face", Slot = "Face" },
-        [17] = { Kind = "Head", Slot = "Head" },
-        [79] = { Kind = "DynamicHead", Slot = "Head" },
-        [27] = { Kind = "Limb", Slot = "Torso", Parts = { "UpperTorso", "LowerTorso" } },
-        [28] = { Kind = "Limb", Slot = "RightArm", Parts = { "RightUpperArm", "RightLowerArm", "RightHand" } },
-        [29] = { Kind = "Limb", Slot = "LeftArm", Parts = { "LeftUpperArm", "LeftLowerArm", "LeftHand" } },
-        [30] = { Kind = "Limb", Slot = "LeftLeg", Parts = { "LeftUpperLeg", "LeftLowerLeg", "LeftFoot" } },
-        [31] = { Kind = "Limb", Slot = "RightLeg", Parts = { "RightUpperLeg", "RightLowerLeg", "RightFoot" } },
+        -- Field = the property of a HumanoidDescription that takes this asset
+        [17] = { Kind = "Body", Field = "Head" },
+        [79] = { Kind = "Body", Field = "Head" },
+        [27] = { Kind = "Body", Field = "Torso" },
+        [28] = { Kind = "Body", Field = "RightArm" },
+        [29] = { Kind = "Body", Field = "LeftArm" },
+        [30] = { Kind = "Body", Field = "LeftLeg" },
+        [31] = { Kind = "Body", Field = "RightLeg" },
     }
     for _, assetType in ipairs({ 8, 41, 42, 43, 44, 45, 46, 47, 64, 65, 66, 67, 68, 69, 70, 71, 72 }) do
         TYPE_INFO[assetType] = { Kind = "Accessory" }
@@ -1266,132 +1266,297 @@ do
         if face and face:GetAttribute("VisualCatalogId") == assetId then face:Destroy() end
     end
 
-    -- ---------- head (classic head or the mesh of a dynamic head) ----------
-    local function ApplyHead(rig, assetId, loaded)
-        local head = rig:FindFirstChild("Head")
-        if not head then return false end
+    -- ---------- body (head, torso, arms, legs) ----------
+    -- Body parts are not copied one mesh at a time: the proportions and the joints of a body change with them (a
+    -- short body wearing a tall torso ends up in pieces). So a whole avatar is built from the player's own
+    -- description with the chosen parts put in (Players:CreateHumanoidModelFromDescription), and then the size, mesh,
+    -- attachments and joint offsets of every body part of the rig are made to match that model. Taking the parts off
+    -- puts every value back from the copy that was made before the first change. R6 rigs take the body shape
+    -- (CharacterMesh) and the head mesh instead.
+    local R15_BODY = {
+        "Head", "UpperTorso", "LowerTorso",
+        "LeftUpperArm", "LeftLowerArm", "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightUpperLeg", "RightLowerLeg", "RightFoot",
+    }
+    local bodyOverrides = {} -- [description field] = assetId
+    local baseDescription
+    local bodyModels = {}    -- [rig type .. overrides] = the model built for them
+    local bodyBusy = false
 
-        local source = loaded:IsA("MeshPart") and loaded
-            or loaded:FindFirstChildWhichIsA("SpecialMesh", true)
-            or loaded:FindFirstChildWhichIsA("MeshPart", true)
-        if not source then return false end
+    local function BaseDescription()
+        if baseDescription then return baseDescription end
+        local ok, description = pcall(function() return Players:GetHumanoidDescriptionFromUserId(Players.LocalPlayer.UserId) end)
+        if not ok or not description then return nil end
+        -- only the body is wanted from the model: no accessories or clothes of the player's own
+        pcall(function() description:SetAccessories({}, true) end)
+        for _, field in ipairs({ "Shirt", "Pants", "GraphicTShirt" }) do
+            pcall(function() description[field] = 0 end)
+        end
+        baseDescription = description
+        return description
+    end
 
-        local store = Store(rig)
-        if head:IsA("MeshPart") then
-            if not store.HeadLook then store.HeadLook = ReadLook(head) end
-            local look
-            if source:IsA("SpecialMesh") then
-                look = { MeshId = source.MeshId, TextureID = source.TextureId, Color = head.Color, Material = head.Material, Transparency = head.Transparency, Appearance = {} }
-            else
-                look = ReadLook(source)
+    local function OverridesKey()
+        local fields = {}
+        for field in pairs(bodyOverrides) do table.insert(fields, field) end
+        table.sort(fields)
+        local parts = {}
+        for _, field in ipairs(fields) do table.insert(parts, field .. "=" .. IdText(bodyOverrides[field])) end
+        return table.concat(parts, ",")
+    end
+
+    -- May yield (the avatar data and the meshes are downloaded).
+    local function BuildBodyModel(r15)
+        local prefix = r15 and "R15:" or "R6:"
+        local key = prefix .. OverridesKey()
+        if bodyModels[key] then return bodyModels[key] end
+
+        local base = BaseDescription()
+        if not base then return nil, "Could not read your avatar data." end
+        local description = base:Clone()
+        for field, assetId in pairs(bodyOverrides) do description[field] = assetId end
+
+        local rigType = r15 and Enum.HumanoidRigType.R15 or Enum.HumanoidRigType.R6
+        local ok, model = pcall(function() return Players:CreateHumanoidModelFromDescription(description, rigType) end)
+        if not ok or not model then return nil, "Could not build a body from these parts." end
+
+        -- wait (not forever) for the meshes, so the sizes are the real ones
+        local loaded = false
+        task.spawn(function()
+            pcall(function() game:GetService("ContentProvider"):PreloadAsync({ model }) end)
+            loaded = true
+        end)
+        local started = os.clock()
+        while not loaded and os.clock() - started < 5 do task.wait() end
+
+        for oldKey, old in pairs(bodyModels) do
+            if string.sub(oldKey, 1, #prefix) == prefix then
+                pcall(function() old:Destroy() end)
+                bodyModels[oldKey] = nil
             end
-            return ApplyLook(head, look)
+        end
+        bodyModels[key] = model
+        return model
+    end
+
+    local function JointsByPart1(root)
+        local map = {}
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("Motor6D") and descendant.Part1 then map[descendant.Part1.Name] = descendant end
+        end
+        return map
+    end
+
+    local function MeshState(mesh)
+        return { Mesh = mesh, MeshType = mesh.MeshType, MeshId = mesh.MeshId, TextureId = mesh.TextureId, Scale = mesh.Scale, Offset = mesh.Offset }
+    end
+
+    local function RestoreMesh(saved)
+        if saved and saved.Mesh.Parent then
+            saved.Mesh.MeshType = saved.MeshType
+            saved.Mesh.MeshId = saved.MeshId
+            saved.Mesh.TextureId = saved.TextureId
+            saved.Mesh.Scale = saved.Scale
+            saved.Mesh.Offset = saved.Offset
+        end
+    end
+
+    -- The head part of the rig can be a Part with a SpecialMesh or a MeshPart, and so can the model's.
+    local function SyncHead(dst, src, original)
+        if dst:IsA("MeshPart") then
+            if src:IsA("MeshPart") then return ApplyLook(dst, ReadLook(src)) end
+            local mesh = src:FindFirstChildWhichIsA("SpecialMesh")
+            if not mesh then return false end
+            return ApplyLook(dst, { MeshId = mesh.MeshId, TextureID = mesh.TextureId, Color = dst.Color, Material = dst.Material, Transparency = dst.Transparency, Appearance = {} })
         end
 
-        -- classic rig: the Head part has a SpecialMesh
-        if not source:IsA("SpecialMesh") then return false end
-        local mesh = head:FindFirstChildWhichIsA("SpecialMesh")
+        local mesh = dst:FindFirstChildWhichIsA("SpecialMesh")
         if not mesh then
             mesh = Instance.new("SpecialMesh")
             mesh:SetAttribute("VisualCatalogMade", true)
-            mesh.Parent = head
+            mesh.Parent = dst
+            original.MadeMesh = mesh
         end
-        if not store.HeadMesh then
-            store.HeadMesh = { Mesh = mesh, Made = mesh:GetAttribute("VisualCatalogMade") == true, MeshType = mesh.MeshType, MeshId = mesh.MeshId, TextureId = mesh.TextureId, Scale = mesh.Scale, Offset = mesh.Offset }
+        local srcMesh = src:FindFirstChildWhichIsA("SpecialMesh")
+        if srcMesh then
+            mesh.MeshType = srcMesh.MeshType
+            mesh.MeshId = srcMesh.MeshId
+            mesh.TextureId = srcMesh.TextureId
+            mesh.Scale = srcMesh.Scale
+            mesh.Offset = srcMesh.Offset
+            return true
+        elseif src:IsA("MeshPart") then
+            mesh.MeshType = Enum.MeshType.FileMesh
+            mesh.MeshId = src.MeshId
+            mesh.TextureId = src.TextureID
+            mesh.Scale = Vector3.new(1, 1, 1)
+            mesh.Offset = Vector3.new(0, 0, 0)
+            return true
         end
-        mesh.MeshType = Enum.MeshType.FileMesh
-        mesh.MeshId = source.MeshId
-        mesh.TextureId = source.TextureId
-        mesh.Scale = source.Scale
-        mesh.Offset = source.Offset
-        return true
+        return false
     end
 
-    local function RemoveHead(rig)
+    local function SyncBody15(rig, humanoid, model)
+        local store = Store(rig)
+        if not store.Body then
+            local original = { Humanoid = humanoid, HipHeight = humanoid.HipHeight, Parts = {} }
+            local joints = JointsByPart1(rig)
+            for _, name in ipairs(R15_BODY) do
+                local part = rig:FindFirstChild(name)
+                if part and part:IsA("BasePart") then
+                    local data = { Part = part, Size = part.Size, Attachments = {} }
+                    if part:IsA("MeshPart") then
+                        data.Look = ReadLook(part)
+                    else
+                        local mesh = part:FindFirstChildWhichIsA("SpecialMesh")
+                        if mesh then data.Mesh = MeshState(mesh) end
+                    end
+                    for _, child in ipairs(part:GetChildren()) do
+                        if child:IsA("Attachment") then data.Attachments[child] = child.CFrame end
+                    end
+                    local joint = joints[name]
+                    if joint then data.Joint = { Motor = joint, C0 = joint.C0, C1 = joint.C1 } end
+                    original.Parts[name] = data
+                end
+            end
+            store.Body = original
+        end
+
+        local modelJoints = JointsByPart1(model)
+        local changed = false
+        for name, data in pairs(store.Body.Parts) do
+            local dst, src = data.Part, model:FindFirstChild(name)
+            if dst.Parent and src and src:IsA("BasePart") then
+                if name == "Head" then
+                    if SyncHead(dst, src, store.Body) then changed = true end
+                elseif dst:IsA("MeshPart") and src:IsA("MeshPart") then
+                    if ApplyLook(dst, ReadLook(src)) then changed = true end
+                end
+                pcall(function() dst.Size = src.Size end)
+                for attachment in pairs(data.Attachments) do
+                    local counterpart = src:FindFirstChild(attachment.Name)
+                    if counterpart and counterpart:IsA("Attachment") then attachment.CFrame = counterpart.CFrame end
+                end
+                local modelJoint = modelJoints[name]
+                if data.Joint and modelJoint then
+                    data.Joint.Motor.C0 = modelJoint.C0
+                    data.Joint.Motor.C1 = modelJoint.C1
+                end
+            end
+        end
+
+        local modelHumanoid = model:FindFirstChildOfClass("Humanoid")
+        if modelHumanoid then pcall(function() humanoid.HipHeight = modelHumanoid.HipHeight end) end
+        return changed
+    end
+
+    local function RestoreBody15(store)
+        local body = store.Body
+        if not body then return end
+        for _, data in pairs(body.Parts) do
+            local part = data.Part
+            if part.Parent then
+                if data.Look then ApplyLook(part, data.Look) end
+                RestoreMesh(data.Mesh)
+                pcall(function() part.Size = data.Size end)
+                for attachment, cframe in pairs(data.Attachments) do
+                    if attachment.Parent then attachment.CFrame = cframe end
+                end
+                if data.Joint and data.Joint.Motor.Parent then
+                    data.Joint.Motor.C0 = data.Joint.C0
+                    data.Joint.Motor.C1 = data.Joint.C1
+                end
+            end
+        end
+        if body.MadeMesh and body.MadeMesh.Parent then body.MadeMesh:Destroy() end
+        pcall(function() body.Humanoid.HipHeight = body.HipHeight end)
+        store.Body = nil
+    end
+
+    local function SyncBodyR6(rig, humanoid, model)
         local store = Store(rig)
         local head = rig:FindFirstChild("Head")
-        if store.HeadLook and head then
-            ApplyLook(head, store.HeadLook)
-        end
-        store.HeadLook = nil
-
-        local saved = store.HeadMesh
-        if saved and saved.Mesh.Parent then
-            if saved.Made then
-                saved.Mesh:Destroy()
-            else
-                saved.Mesh.MeshType = saved.MeshType
-                saved.Mesh.MeshId = saved.MeshId
-                saved.Mesh.TextureId = saved.TextureId
-                saved.Mesh.Scale = saved.Scale
-                saved.Mesh.Offset = saved.Offset
-            end
-        end
-        store.HeadMesh = nil
-    end
-
-    -- ---------- body parts ----------
-    local function ApplyLimb(rig, humanoid, assetId, loaded, info)
-        local store = Store(rig)
-        local changed = false
-
-        if IsR15(humanoid) then
-            store.Looks = store.Looks or {}
-            for _, name in ipairs(info.Parts) do
-                local source = (loaded:IsA("MeshPart") and loaded.Name == name) and loaded or loaded:FindFirstChild(name, true)
-                local dst = rig:FindFirstChild(name)
-                if source and dst and source:IsA("MeshPart") and dst:IsA("MeshPart") then
-                    if not store.Looks[dst] then store.Looks[dst] = ReadLook(dst) end
-                    if ApplyLook(dst, ReadLook(source)) then changed = true end
-                end
-            end
-        else
-            -- R6 rigs take CharacterMesh objects
+        if not store.Body6 then
             local meshes = {}
-            if loaded:IsA("CharacterMesh") then table.insert(meshes, loaded) end
-            for _, descendant in ipairs(loaded:GetDescendants()) do
-                if descendant:IsA("CharacterMesh") then table.insert(meshes, descendant) end
+            for _, child in ipairs(rig:GetChildren()) do
+                if child:IsA("CharacterMesh") then table.insert(meshes, child:Clone()) end
             end
-            store.CharacterMeshes = store.CharacterMeshes or {}
-            for _, mesh in ipairs(meshes) do
-                for _, existing in ipairs(rig:GetChildren()) do
-                    if existing:IsA("CharacterMesh") and existing.BodyPart == mesh.BodyPart then
-                        if not existing:GetAttribute("VisualCatalogId") then table.insert(store.CharacterMeshes, existing:Clone()) end
-                        existing:Destroy()
-                    end
-                end
-                local clone = mesh:Clone()
-                clone:SetAttribute("VisualCatalogId", assetId)
+            local headMesh = head and head:FindFirstChildWhichIsA("SpecialMesh")
+            store.Body6 = { Meshes = meshes, HeadMesh = headMesh and MeshState(headMesh) or nil }
+        end
+
+        for _, child in ipairs(rig:GetChildren()) do
+            if child:IsA("CharacterMesh") then child:Destroy() end
+        end
+        local changed = false
+        for _, child in ipairs(model:GetChildren()) do
+            if child:IsA("CharacterMesh") then
+                local clone = child:Clone()
+                clone:SetAttribute("VisualCatalogMade", true)
                 clone.Parent = rig
                 changed = true
             end
         end
+
+        local modelHead = model:FindFirstChild("Head")
+        local source = modelHead and modelHead:FindFirstChildWhichIsA("SpecialMesh")
+        local mesh = head and head:FindFirstChildWhichIsA("SpecialMesh")
+        if source and mesh then
+            mesh.MeshType = source.MeshType
+            mesh.MeshId = source.MeshId
+            mesh.TextureId = source.TextureId
+            mesh.Scale = source.Scale
+            mesh.Offset = source.Offset
+            changed = true
+        end
         return changed
     end
 
-    local function RemoveLimb(rig, humanoid, assetId, info)
-        local store = Store(rig)
-        if IsR15(humanoid) then
-            for _, name in ipairs(info.Parts) do
-                local dst = rig:FindFirstChild(name)
-                if dst and store.Looks and store.Looks[dst] then
-                    ApplyLook(dst, store.Looks[dst])
-                    store.Looks[dst] = nil
-                end
-            end
-        else
-            for _, child in ipairs(rig:GetChildren()) do
-                if child:IsA("CharacterMesh") and child:GetAttribute("VisualCatalogId") == assetId then child:Destroy() end
-            end
-            for _, saved in ipairs(store.CharacterMeshes or {}) do
-                local taken = false
-                for _, existing in ipairs(rig:GetChildren()) do
-                    if existing:IsA("CharacterMesh") and existing.BodyPart == saved.BodyPart then taken = true end
-                end
-                if not taken then saved:Clone().Parent = rig end
-            end
-            store.CharacterMeshes = nil
+    local function RestoreBodyR6(store, rig)
+        local saved = store.Body6
+        if not saved then return end
+        for _, child in ipairs(rig:GetChildren()) do
+            if child:IsA("CharacterMesh") then child:Destroy() end
         end
+        for _, mesh in ipairs(saved.Meshes) do mesh:Clone().Parent = rig end
+        RestoreMesh(saved.HeadMesh)
+        store.Body6 = nil
+    end
+
+    local function RestoreBody(rig)
+        local store = Store(rig)
+        RestoreBody15(store)
+        RestoreBodyR6(store, rig)
+    end
+
+    local function ApplyBodyToRig(rig, humanoid)
+        local r15 = IsR15(humanoid)
+        local model, problem = BuildBodyModel(r15)
+        if not model then return false, problem end
+        local ok, changed = pcall(r15 and SyncBody15 or SyncBodyR6, rig, humanoid, model)
+        if not ok then return false, tostring(changed) end
+        return changed, changed and nil or "The parts did not fit this rig."
+    end
+
+    -- May yield. Makes every rig match the current overrides (or its own body again when there are none).
+    local function RefreshBody()
+        while bodyBusy do task.wait(0.1) end
+        bodyBusy = true
+        local anyOk, lastProblem = false, nil
+        local ok, err = pcall(function()
+            for _, rigEntry in ipairs(GetAllRigs()) do
+                if next(bodyOverrides) == nil then
+                    RestoreBody(rigEntry.Rig)
+                    anyOk = true
+                else
+                    local done, problem = ApplyBodyToRig(rigEntry.Rig, rigEntry.Humanoid)
+                    if done then anyOk = true else lastProblem = problem end
+                end
+            end
+        end)
+        bodyBusy = false
+        if not ok then return false, tostring(err) end
+        return anyOk, lastProblem
     end
 
     -- ---------- one item on one rig ----------
@@ -1408,8 +1573,6 @@ do
         if info.Kind == "Accessory" then return EquipAccessory(rig, humanoid, source, assetId) end
         if info.Kind == "Clothing" then return ApplyClothing(rig, assetId, source, info) end
         if info.Kind == "Face" then return ApplyFace(rig, assetId, source) end
-        if info.Kind == "Head" or info.Kind == "DynamicHead" then return ApplyHead(rig, assetId, source) end
-        if info.Kind == "Limb" then return ApplyLimb(rig, humanoid, assetId, source, info) end
         return false
     end
 
@@ -1418,8 +1581,6 @@ do
         if info.Kind == "Accessory" then RemoveAccessory(rig, assetId) end
         if info.Kind == "Clothing" then RemoveClothing(rig, assetId, info) end
         if info.Kind == "Face" then RemoveFace(rig, assetId) end
-        if info.Kind == "Head" or info.Kind == "DynamicHead" then RemoveHead(rig) end
-        if info.Kind == "Limb" then RemoveLimb(rig, humanoid, assetId, info) end
     end
 
     -- ---------- API ----------
@@ -1433,6 +1594,7 @@ do
         return count
     end
 
+    -- takes a worn item off the rigs (body parts are handled by RefreshBody instead)
     local function RemoveInternal(assetId)
         local entry = applied[assetId]
         if not entry then return end
@@ -1443,16 +1605,25 @@ do
         if entry.Info.Slot and slotOwner[entry.Info.Slot] == assetId then slotOwner[entry.Info.Slot] = nil end
     end
 
-    -- May yield (type lookup and download the first time). assetTypeHint skips the type lookup when the caller
-    -- already knows it. Returns true, message or false, reason.
-    function Catalog.Apply(assetId, assetTypeHint)
-        local rigs = GetAllRigs()
-        if #rigs == 0 then return false, "No character found yet. Wait until you have spawned." end
-
+    -- One item. Body parts are only recorded in bodyAdded (the body is rebuilt once for all of them afterwards).
+    local function ApplyItem(rigs, assetId, assetTypeHint, bodyAdded)
         local assetType = Catalog.AssetTypeOf(assetId, assetTypeHint)
         local info = assetType and TYPE_INFO[assetType]
         if not info then
             return false, assetType and ("This item type (" .. assetType .. ") can not be worn here yet.") or "Could not read this item from the catalog."
+        end
+
+        if info.Kind == "Body" then
+            local previous = bodyOverrides[info.Field]
+            local record = { Id = assetId, Field = info.Field }
+            if previous and previous ~= assetId then
+                record.Previous, record.PreviousEntry = previous, applied[previous]
+                applied[previous] = nil
+            end
+            bodyOverrides[info.Field] = assetId
+            applied[assetId] = { Info = info, AssetType = assetType }
+            table.insert(bodyAdded, record)
+            return true
         end
 
         local loaded = LoadAsset(assetId)
@@ -1476,21 +1647,91 @@ do
 
         applied[assetId] = entry
         if info.Slot then slotOwner[info.Slot] = assetId end
-        Changed()
-        return true, "Equipped."
+        return true
     end
 
+    -- May yield. items = a list of { Id, AssetType (optional hint) }. Body parts of one call are put on with a
+    -- single rebuild of the body. Returns true, message or false, the first problem.
+    function Catalog.ApplyMany(items)
+        local rigs = GetAllRigs()
+        if #rigs == 0 then return false, "No character found yet. Wait until you have spawned." end
+
+        local firstProblem
+        local bodyAdded = {}
+        for _, item in ipairs(items) do
+            local ok, message = ApplyItem(rigs, item.Id, item.AssetType, bodyAdded)
+            if not ok then firstProblem = firstProblem or message end
+        end
+
+        if #bodyAdded > 0 then
+            local ok, message = RefreshBody()
+            if not ok then
+                -- put the earlier body parts back
+                for index = #bodyAdded, 1, -1 do
+                    local record = bodyAdded[index]
+                    applied[record.Id] = nil
+                    bodyOverrides[record.Field] = record.Previous
+                    if record.Previous then applied[record.Previous] = record.PreviousEntry end
+                end
+                RefreshBody()
+                firstProblem = firstProblem or message or "This body part did not fit the character."
+            end
+        end
+
+        Changed()
+        return firstProblem == nil, firstProblem or "Equipped."
+    end
+
+    function Catalog.Apply(assetId, assetTypeHint)
+        return Catalog.ApplyMany({ { Id = assetId, AssetType = assetTypeHint } })
+    end
+
+    -- May yield (a body part leaves the body to be rebuilt without it).
     function Catalog.Remove(assetId)
-        RemoveInternal(assetId)
+        local entry = applied[assetId]
+        if entry and entry.Info.Kind == "Body" then
+            if bodyOverrides[entry.Info.Field] == assetId then bodyOverrides[entry.Info.Field] = nil end
+            applied[assetId] = nil
+            RefreshBody()
+        else
+            RemoveInternal(assetId)
+        end
+        Changed()
+    end
+
+    -- May yield. Takes several items off; the body is rebuilt once for all the body parts among them.
+    function Catalog.RemoveMany(assetIds)
+        local hadBody = false
+        for _, assetId in ipairs(assetIds) do
+            local entry = applied[assetId]
+            if entry and entry.Info.Kind == "Body" then
+                hadBody = true
+                if bodyOverrides[entry.Info.Field] == assetId then bodyOverrides[entry.Info.Field] = nil end
+                applied[assetId] = nil
+            else
+                RemoveInternal(assetId)
+            end
+        end
+        if hadBody then RefreshBody() end
         Changed()
     end
 
     -- Takes everything off. Returns how many items were worn.
     function Catalog.Clear()
         local count = 0
-        for assetId in pairs(table.clone(applied)) do
-            RemoveInternal(assetId)
+        local hadBody = false
+        for assetId, entry in pairs(table.clone(applied)) do
+            if entry.Info.Kind == "Body" then
+                hadBody = true
+                applied[assetId] = nil
+            else
+                RemoveInternal(assetId)
+            end
             count = count + 1
+        end
+        if hadBody then
+            bodyOverrides = {}
+            RefreshBody()
         end
         Changed()
         return count
@@ -1506,8 +1747,11 @@ do
                     task.wait(0.5)
                     if alive and rigEntry.Rig.Parent then
                         for assetId, entry in pairs(table.clone(applied)) do
-                            pcall(ApplyToRig, entry, assetId, rigEntry.Rig, rigEntry.Humanoid)
+                            if entry.Info.Kind ~= "Body" then
+                                pcall(ApplyToRig, entry, assetId, rigEntry.Rig, rigEntry.Humanoid)
+                            end
                         end
+                        if next(bodyOverrides) ~= nil then pcall(ApplyBodyToRig, rigEntry.Rig, rigEntry.Humanoid) end
                     end
                 end
             end
@@ -2495,25 +2739,28 @@ local function BuildCatalogUI()
         local parts = entry and view.BundleEntries
         if not parts or #parts == 0 then return end
         if BundleWorn(entry) then
-            for _, part in ipairs(parts) do Catalog.Remove(part.Id) end
-            PaintAll()
-            SetStatus(entry.Name .. " taken off.", THEME.Success)
+            local ids = {}
+            for _, part in ipairs(parts) do table.insert(ids, part.Id) end
+            task.spawn(function()
+                Catalog.RemoveMany(ids)
+                PaintAll()
+                SetStatus(entry.Name .. " taken off.", THEME.Success)
+            end)
             return
         end
         SetStatus("Applying " .. entry.Name .. "...", THEME.SubText, 30)
         task.spawn(function()
-            local failed
+            -- all parts in one go: the body is rebuilt once for the whole bundle
+            local list = {}
             for _, part in ipairs(parts) do
-                if not Catalog.IsApplied(part.Id) then
-                    local ok, message = Catalog.Apply(part.Id, part.AssetType)
-                    if not ok then failed = failed or message end
-                end
+                if not Catalog.IsApplied(part.Id) then table.insert(list, { Id = part.Id, AssetType = part.AssetType }) end
             end
+            local ok, message = Catalog.ApplyMany(list)
             PaintAll()
-            if failed then
-                SetStatus("Some parts did not fit: " .. failed, THEME.Danger, 6)
-            else
+            if ok then
                 SetStatus(entry.Name .. " equipped.", THEME.Success)
+            else
+                SetStatus("Some parts did not fit: " .. tostring(message), THEME.Danger, 6)
             end
         end)
     end)
