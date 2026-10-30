@@ -1167,6 +1167,12 @@ local CELL_HEIGHT, TITLE_HEIGHT, GAP = 112, 20, 6
 local PAGE_SIZE = 30
 local CACHE_SECONDS = 300
 local SEARCH_DELAY = 0.6
+local REQUEST_GAP = 0.9 -- seconds between two catalog requests; Roblox answers bursts with 403 / 429
+
+-- The catalog is asked directly first. Some executors / networks get a 403 from it, so a public mirror of the same
+-- API (same paths, same answers) is the fallback; whichever host answers last is used first next time.
+local HOSTS = { "https://catalog.roblox.com", "https://catalog.roproxy.com" }
+local BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 -- Catalog types: Category 11 is Accessories, Subcategory narrows it to one slot. Hair lives under Body (18).
 local TYPES = {
@@ -1246,41 +1252,58 @@ local function DecodeJson(body)
     return data
 end
 
--- May yield. Returns the decoded JSON table, or nil, a kind ("no-request", "rate", "failed") and a detail text.
-local function CatalogGet(url)
-    local hit = responseCache[url]
+local hostIndex, lastSent = 1, -REQUEST_GAP
+
+-- May yield. Takes the path and query of a catalog search. Returns the decoded JSON table, or nil, a kind
+-- ("no-request", "rate", "failed") and a detail text.
+local function CatalogGet(path)
+    local hit = responseCache[path]
     if hit and os.clock() - hit.At < CACHE_SECONDS then return hit.Data end
 
     local send = RequestFunction()
     if not send then return nil, "no-request" end
 
     local detail = "unknown error"
-    for attempt = 1, 3 do
-        local ok, response = pcall(send, { Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
+    local kind = "failed"
+    for attempt = 1, 4 do
+        -- never faster than one request per REQUEST_GAP
+        while os.clock() - lastSent < REQUEST_GAP do task.wait(0.1) end
+        lastSent = os.clock()
+
+        local host = HOSTS[hostIndex]
+        local ok, response = pcall(send, {
+            Url = host .. path,
+            Method = "GET",
+            Headers = { ["Accept"] = "application/json", ["User-Agent"] = BROWSER_AGENT },
+        })
+
+        local retryOtherHost = true
         if not ok or type(response) ~= "table" then
             detail = "request error: " .. tostring(response)
-            task.wait(1.5)
         else
             local code = response.StatusCode
-            if code == 429 then
-                detail = "HTTP 429"
-                if attempt == 3 then return nil, "rate", detail end
-                task.wait(3)
-            elseif code ~= 200 then
-                detail = "HTTP " .. tostring(code)
-                task.wait(1.5)
-            else
+            if code == 200 then
                 local data, problem = DecodeJson(response.Body)
                 if data then
-                    responseCache[url] = { At = os.clock(), Data = data }
+                    responseCache[path] = { At = os.clock(), Data = data }
                     return data
                 end
                 detail = problem
-                task.wait(1.5)
+                retryOtherHost = false
+            elseif code == 429 then
+                detail = "HTTP 429"
+                kind = "rate"
+                task.wait(3)
+                retryOtherHost = false
+            else
+                detail = "HTTP " .. tostring(code)
             end
         end
+
+        if retryOtherHost and #HOSTS > 1 then hostIndex = hostIndex % #HOSTS + 1 end
+        if detail ~= "HTTP 429" then kind = "failed" end
     end
-    return nil, "failed", detail
+    return nil, kind, detail
 end
 
 local function CatalogUrl(typeInfo, keyword, sort, cursor)
@@ -1290,7 +1313,7 @@ local function CatalogUrl(typeInfo, keyword, sort, cursor)
     table.insert(parts, "SortType=" .. sort.Type)
     if sort.Aggregation then table.insert(parts, "SortAggregation=" .. sort.Aggregation) end
     if cursor then table.insert(parts, "Cursor=" .. HttpService:UrlEncode(cursor)) end
-    return "https://catalog.roblox.com/v1/search/items/details?" .. table.concat(parts, "&")
+    return "/v1/search/items/details?" .. table.concat(parts, "&")
 end
 
 local function BuildAccessoriesUI()
